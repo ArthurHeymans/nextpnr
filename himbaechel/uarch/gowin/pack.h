@@ -45,6 +45,7 @@ struct GowinPacker
 
     // PLL
     void pack_pll(void);
+    bool constrain_pll_outputs(CellInfo &ci);
 
     // Clocks
     void pack_hclk(void);
