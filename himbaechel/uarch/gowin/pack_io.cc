@@ -128,6 +128,11 @@ void GowinPacker::trim_nextpnr_iobs(void)
                         }
                         dst_net->attrs[attr.first] = attr.second;
                     }
+                    // A clock constrained on the top-level port applies to
+                    // the input buffer output that replaces it.
+                    if (o->clkconstr != nullptr && dst_net->clkconstr == nullptr) {
+                        dst_net->clkconstr = std::make_unique<ClockConstraint>(*o->clkconstr);
+                    }
                 }
             }
         }
