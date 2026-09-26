@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <cctype>
 #include <map>
 
 #include "design_utils.h"
@@ -150,17 +152,154 @@ void GowinPacker::pack_inv(void)
 // ===================================
 // PLL
 // ===================================
+// Derive clock constraints for the PLL outputs from a constrained CLKIN, for
+// static configurations with internal feedback. Outputs that already have a
+// constraint keep it. Returns whether a constraint was added.
+bool GowinPacker::constrain_pll_outputs(CellInfo &ci)
+{
+    NetInfo *clkin = ci.getPort(id_CLKIN);
+    if (clkin == nullptr || clkin->clkconstr == nullptr) {
+        return false;
+    }
+    double in_period = ctx->getDelayNS(clkin->clkconstr->period.minDelay());
+
+    auto str_param = [&](const char *name, const char *def) {
+        auto it = ci.params.find(ctx->id(name));
+        std::string val = it == ci.params.end() ? def : it->second.as_string();
+        std::transform(val.begin(), val.end(), val.begin(), [](unsigned char c) { return std::toupper(c); });
+        return val;
+    };
+    // Dividers may be given as integers or as decimal strings.
+    auto int_param = [&](const char *name, int64_t def) -> int64_t {
+        auto it = ci.params.find(ctx->id(name));
+        if (it == ci.params.end()) {
+            return def;
+        }
+        if (it->second.is_string) {
+            std::string val = it->second.as_string();
+            size_t end = 0;
+            try {
+                int64_t num = std::stoll(val, &end);
+                if (end == val.size()) {
+                    return num;
+                }
+            } catch (const std::exception &) {
+            }
+            return -1;
+        }
+        return it->second.as_int64();
+    };
+    bool changed = false;
+    auto constrain = [&](IdString port, double period, bool bypass = false) {
+        NetInfo *net = ci.getPort(port);
+        if (net == nullptr || net->clkconstr != nullptr || period <= 0) {
+            return;
+        }
+        changed = true;
+        net->clkconstr = std::make_unique<ClockConstraint>();
+        if (bypass) {
+            *net->clkconstr = *clkin->clkconstr;
+        } else {
+            net->clkconstr->period = DelayPair(ctx->getDelayFromNS(period));
+            net->clkconstr->high = DelayPair(ctx->getDelayFromNS(period / 2));
+            net->clkconstr->low = DelayPair(ctx->getDelayFromNS(period / 2));
+        }
+        log_info("    Derived frequency constraint of %.2f MHz for net %s\n", 1000.0 / period, ctx->nameOf(net));
+    };
+
+    if (ci.type.in(id_rPLL, id_PLLVR)) {
+        if (str_param("CLKFB_SEL", "internal") != "INTERNAL" || str_param("DYN_IDIV_SEL", "false") != "FALSE" ||
+            str_param("DYN_FBDIV_SEL", "false") != "FALSE" || str_param("DYN_ODIV_SEL", "false") != "FALSE" ||
+            str_param("DYN_DA_EN", "false") != "FALSE" || str_param("DUTYDA_SEL", "1000") != "1000") {
+            return false;
+        }
+        int64_t idiv = int_param("IDIV_SEL", 0), fbdiv = int_param("FBDIV_SEL", 0);
+        int64_t sdiv = int_param("DYN_SDIV_SEL", 2);
+        if (idiv < 0 || idiv > 63 || fbdiv < 0 || fbdiv > 63 || sdiv < 2 || sdiv > 128 || sdiv % 2 != 0) {
+            return false;
+        }
+        // CLKOUT = FCLKIN * (FBDIV_SEL + 1) / (IDIV_SEL + 1); CLKOUTP is
+        // CLKOUT phase shifted, CLKOUTD divides CLKOUT or CLKOUTP by
+        // DYN_SDIV_SEL and CLKOUTD3 by three. The bypass options pass CLKIN
+        // straight to an output; CLKOUTD and CLKOUTD3 are left alone when
+        // their source is bypassed.
+        double period = in_period * (idiv + 1) / (fbdiv + 1);
+        bool bypass = str_param("CLKOUT_BYPASS", "false") == "TRUE";
+        bool bypass_p = str_param("CLKOUTP_BYPASS", "false") == "TRUE";
+        bool bypass_d = str_param("CLKOUTD_BYPASS", "false") == "TRUE";
+        auto div_src_bypassed = [&](const char *src) {
+            return str_param(src, "CLKOUT") == "CLKOUTP" ? bypass_p : bypass;
+        };
+        constrain(id_CLKOUT, bypass ? in_period : period, bypass);
+        constrain(id_CLKOUTP, bypass_p ? in_period : period, bypass_p);
+        if (bypass_d) {
+            constrain(id_CLKOUTD, in_period, true);
+        } else if (!div_src_bypassed("CLKOUTD_SRC")) {
+            constrain(id_CLKOUTD, period * sdiv);
+        }
+        if (!div_src_bypassed("CLKOUTD3_SRC")) {
+            constrain(id_CLKOUTD3, period * 3);
+        }
+        return changed;
+    }
+
+    if (ci.type == id_PLLA) {
+        NetInfo *mdclk = ci.getPort(ctx->id("MDCLK"));
+        if (str_param("CLKFB_SEL", "INTERNAL") != "INTERNAL" || int_param("MDIV_FRAC_SEL", 0) != 0 ||
+            int_param("ODIV0_FRAC_SEL", 0) != 0 || str_param("SSC_EN", "FALSE") != "FALSE" ||
+            str_param("DYN_DPA_EN", "FALSE") != "FALSE" ||
+            (mdclk != nullptr && mdclk->name != ctx->id("$PACKER_GND"))) {
+            return false;
+        }
+        int64_t idiv = int_param("IDIV_SEL", 1), fbdiv = int_param("FBDIV_SEL", 1);
+        int64_t mdiv = int_param("MDIV_SEL", 8);
+        if (idiv <= 0 || fbdiv <= 0 || mdiv <= 0) {
+            return false;
+        }
+        // VCO = FCLKIN / IDIV_SEL * FBDIV_SEL * MDIV_SEL and CLKOUTi =
+        // VCO / ODIVi_SEL, for enabled outputs whose divider is not cascaded.
+        double vco_period = in_period * idiv / (double(fbdiv) * mdiv);
+        for (int i = 0; i <= 6; ++i) {
+            if (str_param(stringf("CLKOUT%d_EN", i).c_str(), i == 0 ? "TRUE" : "FALSE") != "TRUE" ||
+                int_param(stringf("CLK%d_IN_SEL", i).c_str(), 0) != 0 ||
+                int_param(stringf("CLK%d_OUT_SEL", i).c_str(), 0) != 0 ||
+                str_param(stringf("DE%d_EN", i).c_str(), "FALSE") != "FALSE" ||
+                str_param(stringf("DYN_PE%d_SEL", i).c_str(), "FALSE") != "FALSE") {
+                continue;
+            }
+            int64_t odiv = int_param(stringf("ODIV%d_SEL", i).c_str(), 8);
+            if (odiv > 0) {
+                constrain(ctx->idf("CLKOUT%d", i), vco_period * odiv);
+            }
+        }
+    }
+    return changed;
+}
+
 void GowinPacker::pack_pll(void)
 {
     log_info("Pack PLL...\n");
 
     pool<BelId> used_pll_bels;
 
+    // Derive the output constraints before CLKIN may be disconnected for a
+    // dedicated input below. Repeat until nothing changes so that a PLL fed
+    // by another PLL is covered whatever the cell order.
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (auto &cell : ctx->cells) {
+            auto &ci = *cell.second;
+            if (ci.type.in(id_rPLL, id_PLLVR, id_PLLA)) {
+                gwu.remove_brackets(&ci);
+                changed |= constrain_pll_outputs(ci);
+            }
+        }
+    }
+
     for (auto &cell : ctx->cells) {
         auto &ci = *cell.second;
 
         if (ci.type.in(id_rPLL, id_PLLVR, id_PLLA)) {
-            gwu.remove_brackets(&ci);
 
             // If CLKIN is connected to a special pin, then it makes sense
             // to try to place the PLL so that it uses a direct connection

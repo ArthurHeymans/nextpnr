@@ -23,6 +23,7 @@ set(SOURCES
 
 add_nextpnr_himbaechel_microarchitecture(${uarch}
     CORE_SOURCES ${SOURCES}
+    TEST_SOURCES tests/pll.cc
 )
 
 set(ALL_HIMBAECHEL_GOWIN_DEVICES GW1N-1 GW1NZ-1 GW1N-4 GW1N-9 GW1N-9C GW1NS-4 GW2A-18 GW2A-18C GW5A-25A GW5AT-60B GW5AST-138C)
