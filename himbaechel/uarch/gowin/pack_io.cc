@@ -164,6 +164,22 @@ BelId GowinPacker::bind_io(CellInfo &ci)
     return bel;
 }
 
+// Unless released with i2c_as_gpio, the configuration I2C pins keep their
+// I2C function and an IO placed on them may not work.
+void GowinPacker::warn_config_i2c_pin(CellInfo &ci, BelId io_bel)
+{
+    if (!gwu.has_I2CCFG() || ctx->args.options.count("i2c_as_gpio")) {
+        return;
+    }
+    for (IdString func : gwu.get_pin_funcs(io_bel)) {
+        if (func.in(ctx->id("SDA"), ctx->id("SCL"))) {
+            log_warning("IO %s is on the configuration I2C %s pin and may not work unless it is released with "
+                        "'--vopt i2c_as_gpio' (and 'gowin_pack --i2c_as_gpio').\n",
+                        ctx->nameOf(&ci), func.c_str(ctx));
+        }
+    }
+}
+
 void GowinPacker::pack_iobs(void)
 {
     log_info("Pack IOBs...\n");
@@ -186,6 +202,7 @@ void GowinPacker::pack_iobs(void)
             log_error("Unconstrained IO:%s\n", ctx->nameOf(&ci));
         }
         BelId io_bel = bind_io(ci);
+        warn_config_i2c_pin(ci, io_bel);
         Loc io_loc = ctx->getBelLocation(io_bel);
         if (io_loc.y == ctx->getGridDimY() - 1) {
             config_bottom_row(ci, io_loc);
