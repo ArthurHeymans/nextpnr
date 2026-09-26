@@ -255,6 +255,7 @@ NPNR_PACKED_STRUCT(struct Extra_chip_data_POD {
     static constexpr int32_t HAS_5A_HCLK = 65536;
     static constexpr int32_t HAS_EMPTY_QUADRANT = 131072;
     static constexpr int32_t HAS_5A_IDES = 262144;
+    static constexpr int32_t HAS_5A_IOREG = 524288;
 });
 
 } // namespace
