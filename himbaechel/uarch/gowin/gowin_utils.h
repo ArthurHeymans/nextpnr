@@ -117,6 +117,9 @@ struct GowinUtils
     bool has_CLKDIV_HCLK(void) const;
     bool has_5A_HCLK(void) const;
 
+    // IO registers: input register output on Q8, output register input on DI
+    bool has_5A_IOREG(void) const;
+
     // Power saving
     bool has_BANDGAP(void) const;
 
