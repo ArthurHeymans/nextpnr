@@ -21,6 +21,7 @@ struct GowinPacker
 
     // IO
     void pack_iobs(void);
+    void warn_config_i2c_pin(CellInfo &ci, BelId io_bel);
     void pack_i3c(void);
     void pack_mipi(void);
     void pack_diff_iobs(void);

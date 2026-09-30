@@ -547,6 +547,28 @@ void GowinPacker::pack_ssram(void)
     std::vector<IdString> cells_to_remove;
 
     log_info("Pack SSRAMs...\n");
+
+    // Not every device has shadow SRAM (e.g. GW5AT-60B). Say so here rather
+    // than failing in the placer with no BELs left.
+    for (auto &cell : ctx->cells) {
+        CellInfo *ci = cell.second.get();
+        if (!ci->type.in(id_RAM16SDP1, id_RAM16SDP2, id_RAM16SDP4)) {
+            continue;
+        }
+        bool has_ssram = false;
+        for (BelId bel : ctx->getBels()) {
+            if (ctx->getBelType(bel) == id_RAM16SDP4) {
+                has_ssram = true;
+                break;
+            }
+        }
+        if (!has_ssram) {
+            log_error("%s: this device has no shadow SRAM for %s cells, synthesise with 'synth_gowin -nolutram'.\n",
+                      ctx->nameOf(ci), ci->type.c_str(ctx));
+        }
+        break;
+    }
+
     for (auto &cell : ctx->cells) {
         auto ci = cell.second.get();
         if (ci->cluster != ClusterId()) {
