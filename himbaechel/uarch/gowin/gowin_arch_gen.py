@@ -39,6 +39,7 @@ CHIP_NEED_BSRAM_DP_CE_FIX   = 0x8000
 CHIP_HAS_5A_HCLK            = 0x10000
 CHIP_HAS_EMPTY_QUADRANT     = 0x20000
 CHIP_HAS_5A_STYLE_IDES      = 0x40000
+CHIP_HAS_5A_IOREG           = 0x80000
 
 # Tile flags
 TILE_I3C_CAPABLE_IO        = 0x1
@@ -2161,6 +2162,8 @@ def main():
             chip_flags |= CHIP_HAS_EMPTY_QUADRANT;
         if "HAS_5A_IDES" in db.chip_flags:
             chip_flags |= CHIP_HAS_5A_STYLE_IDES
+        if "HAS_5A_IOREG" in db.chip_flags:
+            chip_flags |= CHIP_HAS_5A_IOREG;
 
     X = db.cols;
     Y = db.rows;

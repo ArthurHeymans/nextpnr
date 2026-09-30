@@ -169,6 +169,22 @@ BelId GowinPacker::bind_io(CellInfo &ci)
     return bel;
 }
 
+// Unless released with i2c_as_gpio, the configuration I2C pins keep their
+// I2C function and an IO placed on them may not work.
+void GowinPacker::warn_config_i2c_pin(CellInfo &ci, BelId io_bel)
+{
+    if (!gwu.has_I2CCFG() || ctx->args.options.count("i2c_as_gpio")) {
+        return;
+    }
+    for (IdString func : gwu.get_pin_funcs(io_bel)) {
+        if (func.in(ctx->id("SDA"), ctx->id("SCL"))) {
+            log_warning("IO %s is on the configuration I2C %s pin and may not work unless it is released with "
+                        "'--vopt i2c_as_gpio' (and 'gowin_pack --i2c_as_gpio').\n",
+                        ctx->nameOf(&ci), func.c_str(ctx));
+        }
+    }
+}
+
 void GowinPacker::pack_iobs(void)
 {
     log_info("Pack IOBs...\n");
@@ -191,6 +207,7 @@ void GowinPacker::pack_iobs(void)
             log_error("Unconstrained IO:%s\n", ctx->nameOf(&ci));
         }
         BelId io_bel = bind_io(ci);
+        warn_config_i2c_pin(ci, io_bel);
         Loc io_loc = ctx->getBelLocation(io_bel);
         if (io_loc.y == ctx->getGridDimY() - 1) {
             config_bottom_row(ci, io_loc);
@@ -635,6 +652,8 @@ void GowinPacker::pack_io_regs(void)
             reg_type = ff->type;
 
             // create IOLOGIC cell for flipflop
+            // On GW5A the input register drives Q8 rather than Q4.
+            IdString ireg_q = gwu.has_5A_IOREG() ? id_Q8 : id_Q4;
             IdString iologic_name = gwu.create_aux_name(ci.name, 0, "_iobff$");
             auto iologic_cell = gwu.create_cell(iologic_name, id_IOLOGICI_EMPTY);
             new_cells.push_back(std::move(iologic_cell));
@@ -643,7 +662,7 @@ void GowinPacker::pack_io_regs(void)
             // move ports
             for (auto &port : ff->ports) {
                 IdString port_name = port.first;
-                ff->movePortTo(port_name, iologic_i, port_name != id_Q ? port_name : id_Q4);
+                ff->movePortTo(port_name, iologic_i, port_name != id_Q ? port_name : ireg_q);
             }
             if (ctx->verbose) {
                 log_info("  place FF %s into IBUF %s, make iologic_i %s\n", ctx->nameOf(ff), ctx->nameOf(&ci),
@@ -734,6 +753,8 @@ void GowinPacker::pack_io_regs(void)
                     }
 
                     // create IOLOGIC cell for flipflop
+                    // On GW5A the output register takes its data from DI rather than D0.
+                    IdString oreg_d = gwu.has_5A_IOREG() ? id_DI : id_D0;
                     IdString iologic_name = gwu.create_aux_name(ci.name, 1, "_iobff$");
                     auto iologic_cell = gwu.create_cell(iologic_name, id_IOLOGICO_EMPTY);
                     new_cells.push_back(std::move(iologic_cell));
@@ -742,7 +763,7 @@ void GowinPacker::pack_io_regs(void)
                     // move ports
                     for (auto &port : ff->ports) {
                         IdString port_name = port.first;
-                        ff->movePortTo(port_name, iologic_o, port_name != id_D ? port_name : id_D0);
+                        ff->movePortTo(port_name, iologic_o, port_name != id_D ? port_name : oreg_d);
                     }
                     if (ctx->verbose) {
                         log_info("  place FF %s into OBUF %s, make iologic_o %s\n", ctx->nameOf(ff), ctx->nameOf(&ci),
@@ -758,6 +779,11 @@ void GowinPacker::pack_io_regs(void)
         // output enable reg in IO
         if (ci.type == id_IOBUF && (ctx->settings.count(id_IOREG_IN_IOB) || ci.attrs.count(id_IOBFF))) {
             do {
+                // The tristate register of the GW5A IO logic is not known yet,
+                // so the FF stays in the fabric.
+                if (gwu.has_5A_IOREG()) {
+                    break;
+                }
                 if (ci.getPort(id_OEN) == nullptr) {
                     break;
                 }
