@@ -1260,6 +1260,11 @@ void GowinImpl::create_passthrough_luts(void)
     for (auto &cell : new_cells) {
         ctx->cells[cell->name] = std::move(cell);
     }
+    int lut_count = 0;
+    for (const auto &cell : ctx->cells)
+        lut_count += is_lut(cell.second.get());
+    log_info("Post-placement LUT cells: %d (including passthrough and shadow-SRAM LUTs; excluding blockers).\n",
+             lut_count);
 }
 
 // DFFs must be same type or compatible

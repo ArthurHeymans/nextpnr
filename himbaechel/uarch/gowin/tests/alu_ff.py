@@ -30,6 +30,10 @@ with tempfile.TemporaryDirectory() as directory:
     assert match and 0 < int(match[1]) < 6, output
 
     cells = json.loads(placed.read_text())["modules"]["top"]["cells"]
+    lut_count = re.search(r"Post-placement LUT cells: (\d+)", output)
+    assert lut_count and int(lut_count[1]) == sum(
+        cell["type"] in {"LUT1", "LUT2", "LUT3", "LUT4"} for cell in cells.values()
+    )
     alu_outputs = {
         cell["connections"]["SUM"][0]: cell["attributes"]["NEXTPNR_BEL"]
         for cell in cells.values()
