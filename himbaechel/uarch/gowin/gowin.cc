@@ -144,6 +144,7 @@ po::options_description GowinImpl::getUArchOptions()
     specific.add_options()("disable_gp_clock_routing", "disable clock network routing from GP pins");
     specific.add_options()("sspi_as_gpio", "use SSPI pins as GPIO");
     specific.add_options()("i2c_as_gpio", "use I2C pins as GPIO");
+    specific.add_options()("pack_alu_ff", "experimentally pack ALU output registers into the carry chain");
     return specific;
 }
 

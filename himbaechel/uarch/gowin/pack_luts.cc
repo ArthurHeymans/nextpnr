@@ -518,6 +518,47 @@ void GowinPacker::constrain_lutffs(void)
 
     int lutffs = h.constrain_cell_pairs(lut_outs, dff_ins, 1, 1);
     log_info("Constrained %d LUTFF pairs.\n", lutffs);
+
+    if (!ctx->args.options.count("pack_alu_ff"))
+        return;
+
+    // Use matching control signals throughout each carry-chain tile so that
+    // shared FF control wires cannot make a cluster unplaceable.
+    dict<ClusterId, dict<int, CellInfo *>> tile_ffs;
+    int aluffs = 0;
+    for (auto &entry : ctx->cells) {
+        CellInfo *alu = entry.second.get();
+        if (!is_alu(alu) || alu->cluster == ClusterId())
+            continue;
+        NetInfo *sum = alu->getPort(id_SUM);
+        if (!sum)
+            continue;
+        for (auto &user : sum->users) {
+            CellInfo *ff = user.cell;
+            if (!dff_ins.count(CellTypePort(user)) || ff->cluster != ClusterId() || ff->bel != BelId() ||
+                ff->attrs.count(id_BEL))
+                continue;
+            auto &tile_ff = tile_ffs[alu->cluster][alu->constr_x];
+            if (tile_ff) {
+                bool compatible = ff->type == tile_ff->type;
+                for (IdString port : {id_CLK, id_CE, id_SET, id_RESET, id_PRESET, id_CLEAR})
+                    compatible &= ff->getPort(port) == tile_ff->getPort(port);
+                if (!compatible)
+                    continue;
+            }
+            CellInfo *root = ctx->cells.at(alu->cluster).get();
+            root->constr_children.push_back(ff);
+            ff->cluster = alu->cluster;
+            ff->constr_x = alu->constr_x;
+            ff->constr_y = alu->constr_y;
+            ff->constr_z = 2 * (alu->constr_z - (alu->constr_abs_z ? BelZ::ALU0_Z : 0)) + 1;
+            ff->constr_abs_z = true;
+            tile_ff = ff;
+            ++aluffs;
+            break;
+        }
+    }
+    log_info("Constrained %d ALUFF pairs.\n", aluffs);
 }
 
 // ===================================
