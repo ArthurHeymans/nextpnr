@@ -286,6 +286,8 @@ struct SDCParser
             IdString id = ctx->id(s);
             if (ctx->ports.count(id))
                 ports.emplace_back(SdcEntity::ENTITY_PORT, id);
+            else
+                log_warning("get_ports argument '%s' matched no objects.\n", s.c_str());
         }
         return ports;
     }
@@ -303,6 +305,8 @@ struct SDCParser
             IdString id = ctx->id(s);
             if (ctx->cells.count(id))
                 cells.emplace_back(SdcEntity::ENTITY_CELL, id);
+            else
+                log_warning("get_cells argument '%s' matched no objects.\n", s.c_str());
         }
         return cells;
     }
