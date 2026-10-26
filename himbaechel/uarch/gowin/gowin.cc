@@ -1254,6 +1254,8 @@ void GowinImpl::create_passthrough_luts(void)
             }
         }
     }
+    log_info("Added %zu FF passthrough LUTs after placement (not included in pre-placement utilisation).\n",
+             new_cells.size());
     for (auto &cell : new_cells) {
         ctx->cells[cell->name] = std::move(cell);
     }
