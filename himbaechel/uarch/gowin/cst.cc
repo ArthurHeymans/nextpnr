@@ -110,8 +110,10 @@ struct GowinCstReader
                 adc
             } cst_type;
 
+            int lineno = 0;
             while (!in.eof()) {
                 std::getline(in, line);
+                ++lineno;
                 boost::trim_right(line);
                 if (line.empty()) {
                     continue;
@@ -135,7 +137,7 @@ struct GowinCstReader
                                         cst_type = adc;
                                     } else {
                                         if ((!line.empty()) && (line.rfind("//", 0) == std::string::npos)) {
-                                            log_warning("Invalid constraint: %s\n", line.c_str());
+                                            log_warning("Invalid constraint '%s' (on line %d)\n", line.c_str(), lineno);
                                         }
                                         continue;
                                     }
@@ -149,7 +151,7 @@ struct GowinCstReader
                 CellInfo *ci = ctx->getCellForPinConstraint(match[1].str());
                 const bool constrains_cell = cst_type != clock && cst_type != adc;
                 if (constrains_cell && ci == nullptr) {
-                    log_info("Cell %s not found\n", net.c_str(ctx));
+                    log_warning("unmatched constraint '%s' (on line %d)\n", match[1].str().c_str(), lineno);
                     continue;
                 }
                 switch (cst_type) {
@@ -179,7 +181,7 @@ struct GowinCstReader
                     if (which_clock.at(0) == 'S') {
                         auto ni = ctx->nets.find(net);
                         if (ni == ctx->nets.end()) {
-                            log_info("Net %s not found\n", net.c_str(ctx));
+                            log_warning("unmatched clock net '%s' (on line %d)\n", net.c_str(ctx), lineno);
                             continue;
                         }
                         // if (!allocate_longwire(ni->second.get(), lw_idx)) {
@@ -188,7 +190,7 @@ struct GowinCstReader
                     } else {
                         auto ni = ctx->nets.find(net);
                         if (ni == ctx->nets.end()) {
-                            log_info("Net %s not found\n", net.c_str(ctx));
+                            log_warning("unmatched clock net '%s' (on line %d)\n", net.c_str(ctx), lineno);
                             continue;
                         }
                         if (ctx->debug) {
@@ -217,7 +219,7 @@ struct GowinCstReader
 
                         io_cells[1] = ctx->getCellForPinConstraint(tmp);
                         if (io_cells[1] == nullptr) {
-                            log_info("Cell %s not found\n", tmp.c_str());
+                            log_warning("unmatched differential constraint '%s' (on line %d)\n", tmp.c_str(), lineno);
                             continue;
                         }
                     }
