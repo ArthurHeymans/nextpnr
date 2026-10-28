@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <sstream>
 
 NEXTPNR_NAMESPACE_BEGIN
 
@@ -336,6 +337,7 @@ struct SDCParser
     SdcValue cmd_create_clock(const std::vector<SdcValue> &arguments)
     {
         float period = 10;
+        std::vector<float> waveform;
         for (int i = 1; i < int(arguments.size()); i++) {
             auto &arg = arguments.at(i);
             if (arg.is_string) {
@@ -350,12 +352,26 @@ struct SDCParser
                     } catch (std::exception &e) {
                         log_error("invalid argument '%s' to -period (line %d)\n", val.str.c_str(), lineno);
                     }
+                } else if (s == "-waveform") {
+                    i++;
+                    auto &val = arguments.at(i);
+                    if (!val.is_string)
+                        log_error("expecting a list argument to -waveform (line %d)\n", lineno);
+                    std::istringstream edges(val.str);
+                    waveform.clear();
+                    float edge;
+                    while (edges >> edge)
+                        waveform.push_back(edge);
+                    if (waveform.size() != 2)
+                        log_error("expecting two edges to -waveform (line %d)\n", lineno);
                 } else if (s == "-name") {
                     i++;
                 } else {
                     log_error("unsupported argument '%s' to create_clock\n", s.c_str());
                 }
             } else {
+                if (period <= 0)
+                    log_error("create_clock needs a positive -period (line %d)\n", lineno);
                 for (const auto &ety : arg.list) {
                     NetInfo *net = nullptr;
                     if (ety.type == SdcEntity::ENTITY_PIN)
@@ -368,10 +384,26 @@ struct SDCParser
                         log_error("create_clock applies only to cells, cell pins, or IO ports (line %d)\n", lineno);
 
                     ctx->addClock(net->name, 1000.0f / period);
+                    if (!waveform.empty())
+                        apply_waveform(net, period, waveform);
                 }
             }
         }
         return std::string{};
+    }
+
+    // Apply the duty cycle from a create_clock -waveform argument, which gives
+    // the time of the first rising and the following falling edge within the
+    // period.
+    void apply_waveform(NetInfo *net, float period, const std::vector<float> &waveform)
+    {
+        float rise = waveform.at(0), fall = waveform.at(1);
+        if (rise < 0 || fall <= rise || fall > period)
+            log_error("invalid -waveform {%g %g} for a period of %g (line %d)\n", rise, fall, period, lineno);
+        net->clkconstr->high = DelayPair(ctx->getDelayFromNS(fall - rise));
+        net->clkconstr->low = DelayPair(ctx->getDelayFromNS(period - (fall - rise)));
+        log_info("clock net '%s' has %.3g ns high and %.3g ns low time\n", net->name.c_str(ctx), fall - rise,
+                 period - (fall - rise));
     }
 
     SdcValue cmd_set_false_path(const std::vector<SdcValue> &arguments)

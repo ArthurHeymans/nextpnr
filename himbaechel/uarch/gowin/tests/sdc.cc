@@ -1,7 +1,7 @@
 #include <sstream>
 
-#include "gtest/gtest.h"
 #include "command.h"
+#include "gtest/gtest.h"
 #include "log.h"
 #include "nextpnr.h"
 
@@ -41,6 +41,49 @@ TEST(GowinSdcTest, MissingPortAndCellSelectorsWarn)
 
     log_warn_as_error = old_warn_as_error;
     had_nonfatal_error = old_nonfatal_error;
+}
+
+TEST(GowinSdcTest, CreateClockWaveformSetsDutyCycle)
+{
+    init_share_dirname();
+    ArchArgs args;
+    args.device = "GW5A-LV25MG121NC1/I0";
+    auto ctx = std::make_unique<Context>(args);
+    ctx->uarch->init(ctx.get());
+    ctx->late_init();
+
+    IdString clock = ctx->id("clock");
+    NetInfo *net = ctx->createNet(clock);
+    ctx->ports[clock] = PortInfo{clock, net, PORT_IN};
+
+    std::istringstream sdc("create_clock -period 10 -waveform {2 5} [get_ports {clock}]\n");
+    ctx->read_sdc(sdc);
+
+    ASSERT_NE(net->clkconstr, nullptr);
+    EXPECT_NEAR(ctx->getDelayNS(net->clkconstr->period.minDelay()), 10, 0.001);
+    EXPECT_NEAR(ctx->getDelayNS(net->clkconstr->high.minDelay()), 3, 0.001);
+    EXPECT_NEAR(ctx->getDelayNS(net->clkconstr->low.minDelay()), 7, 0.001);
+}
+
+TEST(GowinSdcTest, CreateClockWithoutWaveformIsFiftyPercentDuty)
+{
+    init_share_dirname();
+    ArchArgs args;
+    args.device = "GW5A-LV25MG121NC1/I0";
+    auto ctx = std::make_unique<Context>(args);
+    ctx->uarch->init(ctx.get());
+    ctx->late_init();
+
+    IdString clock = ctx->id("clock");
+    NetInfo *net = ctx->createNet(clock);
+    ctx->ports[clock] = PortInfo{clock, net, PORT_IN};
+
+    std::istringstream sdc("create_clock -period 10 [get_ports {clock}]\n");
+    ctx->read_sdc(sdc);
+
+    ASSERT_NE(net->clkconstr, nullptr);
+    EXPECT_NEAR(ctx->getDelayNS(net->clkconstr->high.minDelay()), 5, 0.001);
+    EXPECT_NEAR(ctx->getDelayNS(net->clkconstr->low.minDelay()), 5, 0.001);
 }
 
 NEXTPNR_NAMESPACE_END
