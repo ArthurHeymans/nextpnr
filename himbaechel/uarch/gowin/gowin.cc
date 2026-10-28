@@ -1432,8 +1432,12 @@ bool GowinImpl::slice_valid(int x, int y, int z) const
         if (lut || alu) {
             if (lut && lut->type != id_BLOCKER_LUT) {
                 src = fast_cell_info.at(lut->flat_index).lut_f;
-            } else {
+            } else if (alu != nullptr) {
                 src = fast_cell_info.at(alu->flat_index).alu_sum;
+            } else {
+                // A blocker LUT reserves this column for an ALU that is not
+                // placed (yet), so the FF cannot be driven from here.
+                return false;
             }
             if (ff_data.ff_d != src) {
                 return false;
