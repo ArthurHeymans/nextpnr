@@ -559,40 +559,50 @@ void GowinPacker::constrain_lutffs(void)
         return true;
     };
 
-    dict<ClusterId, dict<int, std::vector<std::pair<CellInfo *, CellInfo *>>>> tiles;
+    // FFs in a tile share their clock, set/reset and enable wires in pairs of
+    // adjacent columns (DFF0/1, DFF2/3, ...), which is also what the placement
+    // legality check enforces. Each such pair may use its own control set.
+    auto control_group = [](const CellInfo *alu) {
+        int index = alu->constr_abs_z ? alu->constr_z - BelZ::ALU0_Z : alu->constr_z;
+        return index / 2;
+    };
+
+    dict<ClusterId, dict<int, dict<int, std::vector<std::pair<CellInfo *, CellInfo *>>>>> tiles;
     for (auto &candidate : candidates)
-        tiles[candidate.first->cluster][candidate.first->constr_x].push_back(candidate);
+        tiles[candidate.first->cluster][candidate.first->constr_x][control_group(candidate.first)].push_back(candidate);
 
     int aluffs = 0, aluffs_skipped = 0;
     for (auto &tile : tiles) {
-        for (auto &column : tile.second) {
-            auto &tile_candidates = column.second;
-            // Pack the largest group of FFs with matching control signals; it
-            // leaves the fewest FFs behind that need a passthrough LUT.
-            std::vector<std::vector<std::pair<CellInfo *, CellInfo *>>> groups;
-            for (auto &candidate : tile_candidates) {
-                auto group = std::find_if(groups.begin(), groups.end(), [&](const auto &g) {
-                    return control_set_matches(g.front().second, candidate.second);
-                });
-                if (group == groups.end())
-                    groups.push_back({candidate});
-                else
-                    group->push_back(candidate);
-            }
-            auto best = std::max_element(groups.begin(), groups.end(),
-                                         [](const auto &a, const auto &b) { return a.size() < b.size(); });
-            aluffs_skipped += tile_candidates.size() - best->size();
-            for (auto &candidate : *best) {
-                CellInfo *alu = candidate.first;
-                CellInfo *ff = candidate.second;
-                CellInfo *root = ctx->cells.at(alu->cluster).get();
-                root->constr_children.push_back(ff);
-                ff->cluster = alu->cluster;
-                ff->constr_x = alu->constr_x;
-                ff->constr_y = alu->constr_y;
-                ff->constr_z = 2 * (alu->constr_z - (alu->constr_abs_z ? BelZ::ALU0_Z : 0)) + 1;
-                ff->constr_abs_z = true;
-                ++aluffs;
+        for (auto &columns : tile.second) {
+            for (auto &control_group_candidates : columns.second) {
+                auto &tile_candidates = control_group_candidates.second;
+                // Pack the largest group of FFs with matching control signals; it
+                // leaves the fewest FFs behind that need a passthrough LUT.
+                std::vector<std::vector<std::pair<CellInfo *, CellInfo *>>> groups;
+                for (auto &candidate : tile_candidates) {
+                    auto group = std::find_if(groups.begin(), groups.end(), [&](const auto &g) {
+                        return control_set_matches(g.front().second, candidate.second);
+                    });
+                    if (group == groups.end())
+                        groups.push_back({candidate});
+                    else
+                        group->push_back(candidate);
+                }
+                auto best = std::max_element(groups.begin(), groups.end(),
+                                             [](const auto &a, const auto &b) { return a.size() < b.size(); });
+                aluffs_skipped += tile_candidates.size() - best->size();
+                for (auto &candidate : *best) {
+                    CellInfo *alu = candidate.first;
+                    CellInfo *ff = candidate.second;
+                    CellInfo *root = ctx->cells.at(alu->cluster).get();
+                    root->constr_children.push_back(ff);
+                    ff->cluster = alu->cluster;
+                    ff->constr_x = alu->constr_x;
+                    ff->constr_y = alu->constr_y;
+                    ff->constr_z = 2 * (alu->constr_z - (alu->constr_abs_z ? BelZ::ALU0_Z : 0)) + 1;
+                    ff->constr_abs_z = true;
+                    ++aluffs;
+                }
             }
         }
     }
