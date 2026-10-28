@@ -29,6 +29,17 @@
 
 NEXTPNR_NAMESPACE_BEGIN
 
+// Time available between a launch edge and a capture edge at the constrained
+// clock frequency. Required times are normalised to the capture edge, so a
+// rising-to-falling path only has the clock's high time and a falling-to-rising
+// path only its low time. Use the waveform from the constraint instead of
+// assuming a 50% duty cycle.
+static delay_t edge_window(const ClockConstraint *cc, ClockEdge capture_edge)
+{
+    NPNR_ASSERT(cc != nullptr);
+    return capture_edge == RISING_EDGE ? cc->low.minDelay() : cc->high.minDelay();
+}
+
 TimingAnalyser::TimingAnalyser(Context *ctx) : ctx(ctx)
 {
     ClockDomainKey key{IdString(), ClockEdge::RISING_EDGE};
@@ -322,14 +333,20 @@ void TimingAnalyser::setup_port_domains()
             continue;
         IdString clk = launch_data.key.clock;
         delay_t period = ctx->getDelayFromNS(1.0e9 / ctx->setting<float>("target_freq"));
+        const ClockConstraint *cc = nullptr;
         if (ctx->nets.count(clk)) {
             NetInfo *clk_net = ctx->nets.at(clk).get();
             if (clk_net->clkconstr) {
-                period = clk_net->clkconstr->period.minDelay();
+                cc = clk_net->clkconstr.get();
+                period = cc->period.minDelay();
             }
         }
-        if (launch_data.key.edge != capture_data.key.edge)
-            period /= 2;
+        if (launch_data.key.edge != capture_data.key.edge) {
+            if (cc == nullptr)
+                period /= 2;
+            else
+                period = edge_window(cc, capture_data.key.edge);
+        }
         dp.period = DelayPair(period);
     }
 }
@@ -759,7 +776,10 @@ void TimingAnalyser::compute_slack()
             if (!setup_only)
                 pdp.second.hold_slack = arr.value.minDelay() - req.value.maxDelay() + clock_to_clock;
             pdp.second.max_path_length = arr.path_length + req.path_length;
-            if (dp.key.launch == dp.key.capture)
+            // dp.period is only set for domain pairs on the same clock net, where
+            // it is the time between the launch and capture edges. Apply it to
+            // opposite edges as well, not just same-edge paths.
+            if (launch_clock == capture_clock)
                 pd.worst_setup_slack = std::min(pd.worst_setup_slack, dp.period.minDelay() + pdp.second.setup_slack);
             dp.worst_setup_slack = std::min(dp.worst_setup_slack, pdp.second.setup_slack);
             if (!setup_only) {
@@ -908,13 +928,11 @@ CriticalPath TimingAnalyser::build_critical_path_report(domain_id_t domain_pair,
     }
 
     if (!launch.is_async() && ctx->nets.at(launch.clock)->clkconstr) {
-        if (launch.edge == capture.edge) {
-            report.max_delay = ctx->nets.at(launch.clock)->clkconstr->period.minDelay();
-        } else if (capture.edge == RISING_EDGE) {
-            report.max_delay = ctx->nets.at(launch.clock)->clkconstr->low.minDelay();
-        } else if (capture.edge == FALLING_EDGE) {
-            report.max_delay = ctx->nets.at(launch.clock)->clkconstr->high.minDelay();
-        }
+        const ClockConstraint *cc = ctx->nets.at(launch.clock)->clkconstr.get();
+        if (launch.edge == capture.edge)
+            report.max_delay = cc->period.minDelay();
+        else
+            report.max_delay = edge_window(cc, capture.edge);
     }
 
     auto crit_path_rev = walk_crit_path(domain_pair, endpoint, longest_path);
@@ -1102,12 +1120,20 @@ void TimingAnalyser::build_crit_path_reports()
 
         auto path_delay = delay_by_domain.at(i);
 
-        double Fmax;
-
-        if (launch.edge == capture.edge)
-            Fmax = 1000 / ctx->getDelayNS(path_delay);
-        else
-            Fmax = 500 / ctx->getDelayNS(path_delay);
+        // Scale the measured delay up to a full clock period using the time
+        // actually available between the launch and capture edges.
+        double period_ns = 1.0e9 / ctx->setting<float>("target_freq");
+        double window_ns = period_ns;
+        const NetInfo *clk_net = ctx->nets.count(launch.clock) ? ctx->nets.at(launch.clock).get() : nullptr;
+        if (clk_net != nullptr && clk_net->clkconstr) {
+            period_ns = ctx->getDelayNS(clk_net->clkconstr->period.minDelay());
+            window_ns = period_ns;
+            if (launch.edge != capture.edge)
+                window_ns = ctx->getDelayNS(edge_window(clk_net->clkconstr.get(), capture.edge));
+        } else if (launch.edge != capture.edge) {
+            window_ns /= 2;
+        }
+        double Fmax = 1000.0 * window_ns / (ctx->getDelayNS(path_delay) * period_ns);
 
         if (!clock_fmax.count(launch.clock) || Fmax < clock_fmax.at(launch.clock).achieved) {
             float target = ctx->setting<float>("target_freq") / 1e6;
@@ -1182,12 +1208,15 @@ void TimingAnalyser::build_slack_histogram_report()
                     if (launch.clock != capture.clock || launch.is_async())
                         continue;
 
-                    float clk_period = ctx->getDelayFromNS(1.0e9 / ctx->setting<float>("target_freq"));
-                    if (ctx->nets.at(launch.clock)->clkconstr)
-                        clk_period = ctx->nets.at(launch.clock)->clkconstr->period.minDelay();
-
-                    if (launch.edge != capture.edge)
-                        clk_period = clk_period / 2;
+                    delay_t clk_period = ctx->getDelayFromNS(1.0e9 / ctx->setting<float>("target_freq"));
+                    const NetInfo *clk_net = ctx->nets.count(launch.clock) ? ctx->nets.at(launch.clock).get() : nullptr;
+                    if (clk_net != nullptr && clk_net->clkconstr) {
+                        clk_period = clk_net->clkconstr->period.minDelay();
+                        if (launch.edge != capture.edge)
+                            clk_period = edge_window(clk_net->clkconstr.get(), capture.edge);
+                    } else if (launch.edge != capture.edge) {
+                        clk_period /= 2;
+                    }
 
                     delay_t delay = arr.second.value.maxDelay() - req.second.value.minDelay();
                     delay_t slack = clk_period - delay;
