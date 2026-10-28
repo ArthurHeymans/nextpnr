@@ -190,7 +190,13 @@ bool GowinPacker::constrain_pll_outputs(CellInfo &ci)
         return it->second.as_int64();
     };
     bool changed = false;
-    auto constrain = [&](IdString port, double period, bool bypass = false) {
+    // high_time/low_time override the default 50% duty cycle. Divide-by-N
+    // outputs only have a 50% duty cycle when N is even; for odd N a
+    // counter-based divider produces one of (N-1)/2 or (N+1)/2 source periods
+    // of high time, so callers pass the smaller value for both edges. That is
+    // pessimistic for one of the edges, but never optimistic.
+    auto constrain = [&](IdString port, double period, bool bypass = false, double high_time = -1.0,
+                         double low_time = -1.0) {
         NetInfo *net = ci.getPort(port);
         if (net == nullptr || net->clkconstr != nullptr || period <= 0) {
             return;
@@ -200,9 +206,15 @@ bool GowinPacker::constrain_pll_outputs(CellInfo &ci)
         if (bypass) {
             *net->clkconstr = *clkin->clkconstr;
         } else {
+            if (high_time <= 0) {
+                high_time = period / 2;
+            }
+            if (low_time <= 0) {
+                low_time = period - high_time;
+            }
             net->clkconstr->period = DelayPair(ctx->getDelayFromNS(period));
-            net->clkconstr->high = DelayPair(ctx->getDelayFromNS(period / 2));
-            net->clkconstr->low = DelayPair(ctx->getDelayFromNS(period / 2));
+            net->clkconstr->high = DelayPair(ctx->getDelayFromNS(high_time));
+            net->clkconstr->low = DelayPair(ctx->getDelayFromNS(low_time));
         }
         log_info("    Derived frequency constraint of %.2f MHz for net %s\n", 1000.0 / period, ctx->nameOf(net));
     };
@@ -238,7 +250,11 @@ bool GowinPacker::constrain_pll_outputs(CellInfo &ci)
             constrain(id_CLKOUTD, period * sdiv);
         }
         if (!div_src_bypassed("CLKOUTD3_SRC")) {
-            constrain(id_CLKOUTD3, period * 3);
+            // CLKOUTD3 divides by three, so its duty cycle is always 1/3 or 2/3
+            // of the output period (one or two source periods of high time).
+            // Constrain both edges with the shorter of the two so that
+            // opposite-edge timing is never optimistic.
+            constrain(id_CLKOUTD3, period * 3, false, period, period);
         }
         return changed;
     }
@@ -269,7 +285,10 @@ bool GowinPacker::constrain_pll_outputs(CellInfo &ci)
             }
             int64_t odiv = int_param(stringf("ODIV%d_SEL", i).c_str(), 8);
             if (odiv > 0) {
-                constrain(ctx->idf("CLKOUT%d", i), vco_period * odiv);
+                // An odd divider cannot produce a 50% duty cycle; use the
+                // shorter possible high time for both edges like CLKOUTD3.
+                double high_time = (odiv % 2) != 0 ? vco_period * (odiv - 1) / 2 : -1.0;
+                constrain(ctx->idf("CLKOUT%d", i), vco_period * odiv, false, high_time, high_time);
             }
         }
     }

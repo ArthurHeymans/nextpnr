@@ -1,6 +1,6 @@
-#include "gtest/gtest.h"
 #include "command.h"
 #include "design_utils.h"
+#include "gtest/gtest.h"
 #include "nextpnr.h"
 #define HIMBAECHEL_CONSTIDS "uarch/gowin/constids.inc"
 #include "himbaechel_constids.h"
@@ -49,6 +49,16 @@ class GowinPllTest : public ::testing::Test
     {
         return ctx->getDelayNS(cell->getPort(ctx->id(port))->clkconstr->period.minDelay());
     }
+
+    double high(CellInfo *cell, const char *port)
+    {
+        return ctx->getDelayNS(cell->getPort(ctx->id(port))->clkconstr->high.minDelay());
+    }
+
+    double low(CellInfo *cell, const char *port)
+    {
+        return ctx->getDelayNS(cell->getPort(ctx->id(port))->clkconstr->low.minDelay());
+    }
 };
 
 TEST_F(GowinPllTest, StaticDividersAndExistingConstraints)
@@ -63,6 +73,12 @@ TEST_F(GowinPllTest, StaticDividersAndExistingConstraints)
     EXPECT_NEAR(period(cell, "CLKOUTD"), 40.0 / 3, 0.002);
     EXPECT_NEAR(period(cell, "CLKOUTD3"), 20, 0.002);
     EXPECT_NEAR(period(cell, "CLKOUTP"), 20, 0.002);
+    // CLKOUT is 50/50, CLKOUTD3 divides by three so neither edge may assume
+    // that half of its period is available.
+    EXPECT_NEAR(high(cell, "CLKOUT"), 10.0 / 3, 0.002);
+    EXPECT_NEAR(low(cell, "CLKOUT"), 10.0 / 3, 0.002);
+    EXPECT_NEAR(high(cell, "CLKOUTD3"), 20.0 / 3, 0.002);
+    EXPECT_NEAR(low(cell, "CLKOUTD3"), 20.0 / 3, 0.002);
     EXPECT_FALSE(packer.constrain_pll_outputs(*cell));
 }
 
@@ -107,6 +123,19 @@ TEST_F(GowinPllTest, PllaOutputsAndSpreadSpectrum)
     EXPECT_TRUE(GowinPacker(ctx.get()).constrain_pll_outputs(*cell));
     EXPECT_NEAR(period(cell, "CLKOUT0"), 25.0 / 3, 0.002);
     EXPECT_EQ(cell->getPort(ctx->id("CLKOUT1"))->clkconstr, nullptr);
+}
+
+TEST_F(GowinPllTest, PllaOddDividerUsesShortestHighTime)
+{
+    auto *cell = pll(id_PLLA);
+    cell->params[ctx->id("MDIV_SEL")] = Property(24);
+    cell->params[ctx->id("ODIV0_SEL")] = Property(9);
+    GowinPacker(ctx.get()).constrain_pll_outputs(*cell);
+    // VCO period is 20/24 ns, CLKOUT0 is nine VCO periods and an odd divider
+    // leaves at most four of them for either half cycle.
+    EXPECT_NEAR(period(cell, "CLKOUT0"), 7.5, 0.002);
+    EXPECT_NEAR(high(cell, "CLKOUT0"), 20.0 * 4 / 24, 0.002);
+    EXPECT_NEAR(low(cell, "CLKOUT0"), 20.0 * 4 / 24, 0.002);
 }
 
 NEXTPNR_NAMESPACE_END
