@@ -27,7 +27,10 @@ with tempfile.TemporaryDirectory() as directory:
     ], check=True, capture_output=True, text=True)
     output = result.stdout + result.stderr
     match = re.search(r"Constrained (\d+) ALUFF pairs", output)
-    assert match and 0 < int(match[1]) < 6, output
+    # Five of the six FFs share one clock enable; the odd one out would make the
+    # tile's shared control wires unplaceable, so it keeps a passthrough LUT.
+    assert match and int(match[1]) == 5, output
+    assert re.search(r"Left 1 ALU output FFs unpacked", output), output
 
     cells = json.loads(placed.read_text())["modules"]["top"]["cells"]
     lut_count = re.search(r"Post-placement LUT cells: (\d+)", output)
@@ -47,5 +50,5 @@ with tempfile.TemporaryDirectory() as directory:
         if alu_bel is not None:
             assert alu_bel.replace("/ALU", "/DFF") == cell["attributes"]["NEXTPNR_BEL"]
             direct += 1
-    assert int(match[1]) <= direct < 6
+    assert int(match[1]) == direct, output
     assert any("_passthrough_lut$" in name for name in cells)

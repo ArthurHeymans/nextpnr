@@ -10,6 +10,7 @@
 #include "gowin_utils.h"
 #include "pack.h"
 
+#include <algorithm>
 #include <cinttypes>
 
 NEXTPNR_NAMESPACE_BEGIN
@@ -522,10 +523,13 @@ void GowinPacker::constrain_lutffs(void)
     if (!ctx->args.options.count("pack_alu_ff"))
         return;
 
-    // Use matching control signals throughout each carry-chain tile so that
-    // shared FF control wires cannot make a cluster unplaceable.
-    dict<ClusterId, dict<int, CellInfo *>> tile_ffs;
-    int aluffs = 0;
+    // Each ALU can drive the D input of the FF in its own tile column, so pair
+    // an ALU's SUM output with a directly connected, otherwise unplaced FF
+    // instead of giving that FF a passthrough LUT later on. All FFs packed into
+    // one tile share the same control wires, so a tile may only be used by FFs
+    // with identical control signals. Collect the candidates in name order so
+    // that the result does not depend on hash map iteration order.
+    std::vector<std::pair<CellInfo *, CellInfo *>> candidates;
     for (auto &entry : ctx->cells) {
         CellInfo *alu = entry.second.get();
         if (!is_alu(alu) || alu->cluster == ClusterId())
@@ -538,27 +542,63 @@ void GowinPacker::constrain_lutffs(void)
             if (!dff_ins.count(CellTypePort(user)) || ff->cluster != ClusterId() || ff->bel != BelId() ||
                 ff->attrs.count(id_BEL))
                 continue;
-            auto &tile_ff = tile_ffs[alu->cluster][alu->constr_x];
-            if (tile_ff) {
-                bool compatible = ff->type == tile_ff->type;
-                for (IdString port : {id_CLK, id_CE, id_SET, id_RESET, id_PRESET, id_CLEAR})
-                    compatible &= ff->getPort(port) == tile_ff->getPort(port);
-                if (!compatible)
-                    continue;
-            }
-            CellInfo *root = ctx->cells.at(alu->cluster).get();
-            root->constr_children.push_back(ff);
-            ff->cluster = alu->cluster;
-            ff->constr_x = alu->constr_x;
-            ff->constr_y = alu->constr_y;
-            ff->constr_z = 2 * (alu->constr_z - (alu->constr_abs_z ? BelZ::ALU0_Z : 0)) + 1;
-            ff->constr_abs_z = true;
-            tile_ff = ff;
-            ++aluffs;
+            candidates.emplace_back(alu, ff);
             break;
         }
     }
+    std::sort(candidates.begin(), candidates.end(),
+              [&](const auto &a, const auto &b) { return a.second->name.str(ctx) < b.second->name.str(ctx); });
+
+    auto control_set_matches = [](const CellInfo *a, const CellInfo *b) {
+        if (a->type != b->type)
+            return false;
+        for (IdString port : {id_CLK, id_CE, id_SET, id_RESET, id_PRESET, id_CLEAR}) {
+            if (a->getPort(port) != b->getPort(port))
+                return false;
+        }
+        return true;
+    };
+
+    dict<ClusterId, dict<int, std::vector<std::pair<CellInfo *, CellInfo *>>>> tiles;
+    for (auto &candidate : candidates)
+        tiles[candidate.first->cluster][candidate.first->constr_x].push_back(candidate);
+
+    int aluffs = 0, aluffs_skipped = 0;
+    for (auto &tile : tiles) {
+        for (auto &column : tile.second) {
+            auto &tile_candidates = column.second;
+            // Pack the largest group of FFs with matching control signals; it
+            // leaves the fewest FFs behind that need a passthrough LUT.
+            std::vector<std::vector<std::pair<CellInfo *, CellInfo *>>> groups;
+            for (auto &candidate : tile_candidates) {
+                auto group = std::find_if(groups.begin(), groups.end(), [&](const auto &g) {
+                    return control_set_matches(g.front().second, candidate.second);
+                });
+                if (group == groups.end())
+                    groups.push_back({candidate});
+                else
+                    group->push_back(candidate);
+            }
+            auto best = std::max_element(groups.begin(), groups.end(),
+                                         [](const auto &a, const auto &b) { return a.size() < b.size(); });
+            aluffs_skipped += tile_candidates.size() - best->size();
+            for (auto &candidate : *best) {
+                CellInfo *alu = candidate.first;
+                CellInfo *ff = candidate.second;
+                CellInfo *root = ctx->cells.at(alu->cluster).get();
+                root->constr_children.push_back(ff);
+                ff->cluster = alu->cluster;
+                ff->constr_x = alu->constr_x;
+                ff->constr_y = alu->constr_y;
+                ff->constr_z = 2 * (alu->constr_z - (alu->constr_abs_z ? BelZ::ALU0_Z : 0)) + 1;
+                ff->constr_abs_z = true;
+                ++aluffs;
+            }
+        }
+    }
     log_info("Constrained %d ALUFF pairs.\n", aluffs);
+    if (aluffs_skipped)
+        log_info("Left %d ALU output FFs unpacked to keep one FF control set per tile.\n", aluffs_skipped);
 }
 
 // ===================================
