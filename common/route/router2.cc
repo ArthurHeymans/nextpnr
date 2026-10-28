@@ -1340,8 +1340,10 @@ struct Router2
                 if (bound_net == nullptr) {
                     to_bind.push_back(p);
                 }
-            } else if (!ad.pre_routed ||
-                       ctx->getBoundPipNet(p) != net) { // allow pre routing to break normal validity checking rules
+            } else if (ctx->getBoundPipNet(p) != net) {
+                // A pip that is already bound to this net is part of the arch's
+                // own routing (pre-routed or reserved drivers) and cannot be
+                // rejected by the normal validity rules.
                 if (ctx->verbose) {
                     log_info("Failed to bind pip %s to net %s\n", ctx->nameOfPip(p), net->name.c_str(ctx));
                 }
@@ -1380,15 +1382,26 @@ struct Router2
             if (net->is_global)
                 continue;
 #endif
-            // Ripup wires and pips used by the net in nextpnr's structures
+            // Some arches pre-route parts of the design (for example global
+            // clock networks) with pips whose validity rules differ from normal
+            // routing. Those bindings must survive the ripup below, otherwise
+            // the rebinding fails on every iteration and the router loops
+            // forever.
             net_wires.clear();
             for (auto &w : net->wires) {
-                if (w.second.strength <= STRENGTH_STRONG) {
-                    net_wires.push_back(w.first);
-                } else if (ctx->debug) {
-                    log("Net %s didn't rip up wire %s because strength was %d\n", ctx->nameOf(net),
-                        ctx->nameOfWire(w.first), w.second.strength);
+                if (w.second.strength > STRENGTH_STRONG) {
+                    if (ctx->debug)
+                        log("Net %s didn't rip up wire %s because strength was %d\n", ctx->nameOf(net),
+                            ctx->nameOfWire(w.first), w.second.strength);
+                    continue;
                 }
+                // Keep wires whose uphill pip is bound to this net although the
+                // normal routing rules reject it for this net; that is what arch
+                // pre-routing does, and only the arch can rebind it.
+                PipId pip = w.second.pip;
+                if (pip != PipId() && ctx->getBoundPipNet(pip) == net && !ctx->checkPipAvailForNet(pip, net))
+                    continue;
+                net_wires.push_back(w.first);
             }
             for (auto w : net_wires)
                 ctx->unbindWire(w);
@@ -1721,6 +1734,14 @@ struct Router2
         log_info("Running main router loop...\n");
         if (timing_driven)
             tmg.run(true);
+        // Architecture binding can fail for an arc whose route cannot be
+        // expressed in the arch API (for example a pip that is only valid for
+        // the arch's own pre-routing). Rip-up cannot fix that, so stop once it
+        // fails to shrink the failing set; checkRoutedDesign() reports the arcs
+        // that are left.
+        static constexpr int max_binding_stall = 10;
+        int binding_stall = 0;
+        size_t prev_failed = std::numeric_limits<size_t>::max();
         do {
             ctx->sorted_shuffle(route_queue);
 
@@ -1783,9 +1804,19 @@ struct Router2
                     }
                 }
             }
+            // Architecture binding can fail for an arc whose route cannot be
+            // expressed in the arch API (for example a pip that is only valid
+            // for the arch's own pre-routing). Rip-up cannot fix that, so stop
+            // once it fails to shrink the failing set; checkRoutedDesign()
+            // reports the arcs that are left.
             if (overused_wires == 0 && overused_resources == 0 && tmgfail == 0) {
                 // Try and actually bind nextpnr Arch API wires
                 bind_and_check_all();
+                if (failed_nets.size() >= prev_failed)
+                    ++binding_stall;
+                else
+                    binding_stall = 0;
+                prev_failed = failed_nets.size();
             }
             for (auto cn : failed_nets)
                 route_queue.push_back(cn);
@@ -1805,7 +1836,9 @@ struct Router2
             ++iter;
             if (curr_cong_weight < 1e9)
                 curr_cong_weight += cfg.curr_cong_mult;
-        } while (!failed_nets.empty());
+        } while (!failed_nets.empty() && binding_stall < max_binding_stall);
+        if (!failed_nets.empty())
+            log_warning("Router2 gave up with %zu net(s) that fail architecture binding.\n", failed_nets.size());
         if (cfg.perf_profile) {
             std::vector<std::pair<int, IdString>> nets_by_runtime;
             for (auto &n : nets_by_udata) {
