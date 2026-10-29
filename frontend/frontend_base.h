@@ -123,7 +123,21 @@ struct ModuleInfo
 
 template <typename FrontendType> struct GenericFrontend
 {
-    GenericFrontend(Context *ctx, const FrontendType &impl, bool split_io) : ctx(ctx), impl(impl), split_io(split_io) {}
+    static bool preserve_checkpoint_requested(const Context *ctx)
+    {
+        // Do not intern a new ID or add a setting in the default flow: ID
+        // allocation order can affect deterministic placement.
+        for (const auto &setting : ctx->settings)
+            if (setting.first.str(ctx) == "frontend/preserveCheckpoint")
+                return setting.second.as_int64() != 0;
+        return false;
+    }
+
+    GenericFrontend(Context *ctx, const FrontendType &impl, bool split_io)
+            : ctx(ctx), impl(impl), split_io(split_io),
+              preserve_checkpoint(preserve_checkpoint_requested(ctx))
+    {
+    }
     void operator()()
     {
         // Find which module is top
@@ -147,6 +161,9 @@ template <typename FrontendType> struct GenericFrontend
     Context *ctx;
     const FrontendType &impl;
     const bool split_io;
+    // Opt-in read-only checkpoint analysis must retain even unused nets and
+    // top-level port descriptors, without inserting new IO buffers.
+    const bool preserve_checkpoint;
     using mod_dat_t = typename FrontendType::ModuleDataType;
     using mod_port_dat_t = typename FrontendType::ModulePortDataType;
     using cell_dat_t = typename FrontendType::CellDataType;
@@ -430,6 +447,8 @@ template <typename FrontendType> struct GenericFrontend
                     continue;
                 int net_bit = impl.get_vector_bit_signal(bits, i);
                 int mapped_bit = m.net_by_idx(net_bit);
+                if (mapped_bit == -1 && preserve_checkpoint)
+                    mapped_bit = create_or_get_net(m, net_bit)->udata;
                 if (mapped_bit != -1) {
                     NetInfo *ni = net_flatindex.at(mapped_bit);
                     impl.foreach_attr(nn, [&](const std::string &name, const Property &value) {
@@ -469,6 +488,13 @@ template <typename FrontendType> struct GenericFrontend
                 log_error("Failed to get direction for port '%s' of cell '%s'\n", name.c_str(), inst_name.c_str(ctx));
             PortType dir = port_dirs.at(ctx->id(name));
             int width = impl.get_vector_length(bits);
+            if (preserve_checkpoint && width == 0) {
+                // The checkpoint writer uses [] for a disconnected scalar
+                // port. Preserve the descriptor without creating a new net.
+                auto &port = ci->ports[ctx->id(name)];
+                port.name = ctx->id(name);
+                port.type = dir;
+            }
             for (int i = 0; i < width; i++) {
                 std::string port_bit_name = get_bit_name(name, i, width);
                 IdString port_bit_ids = ctx->id(port_bit_name);
@@ -486,7 +512,11 @@ template <typename FrontendType> struct GenericFrontend
                                               impl.get_vector_bit_constval(bits, i));
                 } else {
                     // Otherwise, lookup (creating if needed) the net with this index
-                    net = create_or_get_net(m, impl.get_vector_bit_signal(bits, i));
+                    int bit = impl.get_vector_bit_signal(bits, i);
+                    if (preserve_checkpoint && (bit >= int(m.net_names.size()) || m.net_names.at(bit).empty()))
+                        log_error("Checkpoint signal %d on %s.%s has no saved net name; "
+                                  "unnamed/dummy bus bits are unsupported.\n", bit, ctx->nameOf(ci), name.c_str());
+                    net = create_or_get_net(m, bit);
                 }
                 NPNR_ASSERT(net != nullptr);
 
@@ -568,8 +598,16 @@ template <typename FrontendType> struct GenericFrontend
     CellInfo *create_iobuf(NetInfo *net, PortType dir, const std::string &name)
     {
         // Skip IOBUF insertion if this is a design checkpoint (where they will already exist)
-        if (ctx->settings.count(ctx->id("synth")))
+        if (ctx->settings.count(ctx->id("synth"))) {
+            if (preserve_checkpoint) {
+                PortInfo pinfo;
+                pinfo.name = ctx->id(name);
+                pinfo.net = net;
+                pinfo.type = dir;
+                ctx->ports[pinfo.name] = pinfo;
+            }
             return nullptr;
+        }
         IdString name_id = ctx->id(name);
         if (ctx->cells.count(name_id))
             log_error("Cell '%s' of type '%s' with the same name as a top-level IO is not allowed.\n", name.c_str(),

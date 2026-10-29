@@ -1317,10 +1317,7 @@ def create_logic_tiletype(chip: Chip, db: chipdb, x: int, y: int, ttyp: int, tde
         for inp_name in lut_inputs:
             create_reuse_wire(tt, f"{inp_name}{i}", "LUT_IN")
         create_reuse_wire(tt, f"F{i}", "LUT_OUT")
-        # experimental. the wire is false - it is assumed that DFF is always
-        # connected to the LUT's output F{i}, but we can place primitives
-        # arbitrarily and create a pass-through LUT afterwards.
-        # just out of curiosity
+        # Register data sink, driven by F or (on GW5A-25A) the SEL mux.
         create_reuse_wire(tt, f"XD{i}", "FF_INPUT")
         create_reuse_wire(tt, f"Q{i}", "FF_OUT")
     # setup DFF wires
@@ -1347,10 +1344,12 @@ def create_logic_tiletype(chip: Chip, db: chipdb, x: int, y: int, ttyp: int, tde
         tt.add_bel_pin(lut, "F", f"F{i}", PinType.OUTPUT)
         if i < 6 or "HAS_DFF67" in db.chip_flags:
             tt.create_pip(f"F{i}", f"XD{i}", get_tm_class(db, f"F{i}"))
-            # also experimental input for FF using SEL wire - this theory will
-            # allow to place unrelated LUT and FF next to each other
-            # don't create for now
-            #tt.create_pip(f"SEL{i}", f"XD{i}", get_tm_class(db, f"SEL{i}"))
+            # REG<n>_SD selects the routed SEL input rather than F. The
+            # architecture gates these pips behind --vopt ff_d_from_sel until
+            # the matching packer and hardware configuration are validated.
+            # D<i> is a LUT input mux, not the register's data input.
+            if chip.name == "GW5A-25A":
+                tt.create_pip(f"SEL{i}", f"XD{i}", get_tm_class(db, f"SEL{i}"))
 
             # FF
             ff = tt.create_bel(f"DFF{i}", "DFF", z =(i * 2 + 1))
@@ -2059,7 +2058,7 @@ def create_timing_info(chip: Chip, db: chipdb.Device):
                     add_bram_bus_input(dp, "CLKA", "DIA", 36, "clka_dia")
                     add_bram_bus_input(dp, "CLKB", "DIB", 36, "clkb_dib")
                     add_bram_bus_input(dp, "CLKA", "ADA", 14, "clka_ada")
-                    add_bram_bus_input(sp, "CLKB", "ADB", 14, "clkb_adb")
+                    add_bram_bus_input(dp, "CLKB", "ADB", 14, "clkb_adb")
 
                     add_bram_bus_input(dp, "CLKA", "BLKSELA", 3, "clka_blksel")
                     add_bram_bus_input(dp, "CLKB", "BLKSELB", 3, "clkb_blksel")

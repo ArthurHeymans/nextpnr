@@ -1,3 +1,6 @@
+#include <boost/algorithm/string.hpp>
+#include <cmath>
+#include <limits>
 #include <map>
 #include <regex>
 
@@ -15,6 +18,7 @@
 #include "globals.h"
 #include "gowin.h"
 #include "gowin_utils.h"
+#include "modern_ff.h"
 #include "pack.h"
 
 #include "placer_heap.h"
@@ -35,11 +39,24 @@ struct GowinImpl : HimbaechelAPI
     void postPlace() override;
     void preRoute() override;
     void postRoute() override;
+    bool prepareTimingOnly(const pool<IdString> &unconstrained_clocks) override;
 
     bool isBelLocationValid(BelId bel, bool explain_invalid) const override;
     void notifyBelChange(BelId bel, CellInfo *cell) override;
 
     delay_t estimateDelay(WireId src, WireId dst) const override;
+    TimingPortClass getPortTimingClass(const CellInfo *cell, IdString port, int &count) const override
+    {
+        if (modern_ff && is_dff(cell))
+            return modern_ff->port_class(ctx, cell, port, count);
+        return HimbaechelAPI::getPortTimingClass(cell, port, count);
+    }
+    TimingClockingInfo getPortClockingInfo(const CellInfo *cell, IdString port, int index) const override
+    {
+        if (modern_ff && is_dff(cell))
+            return modern_ff->clocking(ctx, cell, port, index);
+        return HimbaechelAPI::getPortClockingInfo(cell, port, index);
+    }
 
     // Bel bucket functions
     IdString getBelBucketForCellType(IdString cell_type) const override;
@@ -65,6 +82,9 @@ struct GowinImpl : HimbaechelAPI
 
     IdString chip;
     IdString partno;
+    bool ff_d_from_sel = false;
+    bool independent_ff = false;
+    std::unique_ptr<GowinModernFF> modern_ff;
 
     std::set<BelId> inactive_bels;
 
@@ -145,6 +165,14 @@ po::options_description GowinImpl::getUArchOptions()
     specific.add_options()("sspi_as_gpio", "use SSPI pins as GPIO");
     specific.add_options()("i2c_as_gpio", "use I2C pins as GPIO");
     specific.add_options()("pack_alu_ff", "experimentally pack ALU output registers into the carry chain");
+    specific.add_options()("placer_timing_trace", po::value<std::string>(),
+                           "write experimental HeAP predicted timing/criticality traces to a new JSONL file");
+    specific.add_options()("modern_ff_timing", po::value<std::string>(),
+                           "experimental GW5A-25 C1/I0 FF timing sidecar (not complete STA)");
+    specific.add_options()("ff_d_from_sel", "experimentally route unpaired GW5A-25A register data through SEL");
+    specific.add_options()(
+            "independent_ff",
+            "experimentally share GW5A-25A LUT sites with unrelated registers (implies ff_d_from_sel)");
     return specific;
 }
 
@@ -200,6 +228,16 @@ void GowinImpl::init(Context *ctx)
 
     gwu.init(ctx);
 
+    // Restoring a placed JSON binds BELs before prePlace(). The binding
+    // callback needs this cache even when placement is deliberately skipped.
+    fast_logic_cell.reset(ctx->getGridDimX(), ctx->getGridDimY());
+    for (auto bel : ctx->getBels()) {
+        if (ctx->getBelType(bel) == id_LUT4) {
+            Loc loc = ctx->getBelLocation(bel);
+            fast_logic_cell.at(loc.x, loc.y).resize(37);
+        }
+    }
+
     const ArchArgs &args = ctx->args;
 
     // package and speed class
@@ -238,6 +276,27 @@ void GowinImpl::init(Context *ctx)
         ctx->settings[ctx->id("cst.filename")] = args.options["cst"].as<std::string>();
     }
 
+    independent_ff = args.options.count("independent_ff") != 0;
+    ff_d_from_sel = independent_ff || args.options.count("ff_d_from_sel") != 0;
+    if (ff_d_from_sel && chip != ctx->id("GW5A-25A"))
+        log_error("ff_d_from_sel and independent_ff are only supported on GW5A-25A.\n");
+
+    if (args.options.count("modern_ff_timing")) {
+        GowinModernFF::require(chip == ctx->id("GW5A-25A") && pn == "GW5A-LV25MG121NC1/I0",
+                               "only GW5A-LV25MG121NC1/I0 with GW5A-25A architecture is supported");
+        GowinModernFF::require(!args.options.count("ireg_in_iob") && !args.options.count("oreg_in_iob") &&
+                                       !args.options.count("ioreg_in_iob"),
+                               "packed I/O FF timing is not covered");
+        modern_ff = std::make_unique<GowinModernFF>();
+        const auto filename = args.options["modern_ff_timing"].as<std::string>();
+        modern_ff->load(filename);
+        ctx->settings[ctx->id("timing.modern_ff.sidecar")] = filename;
+        ctx->settings[ctx->id("timing.modern_ff.source_sha256")] = modern_ff->source_sha256;
+        ctx->settings[ctx->id("timing.modern_ff.verdict")] = std::string("EXPERIMENTAL_FF_ONLY_NOT_TIMING_SIGNOFF");
+        log_warning("Experimental modern FF timing: source-slot envelopes, M/FS routes only; "
+                    "I/O arcs, OFX, other FF types/profiles and full STA remain unsupported.\n");
+    }
+
     // place registers in IO blocks
     if (args.options.count("ireg_in_iob")) {
         ctx->settings[id_IREG_IN_IOB] = Property(1);
@@ -266,21 +325,231 @@ void GowinImpl::init(Context *ctx)
     }
 }
 
+bool GowinImpl::prepareTimingOnly(const pool<IdString> &unconstrained_clocks)
+{
+    // Checkpoints currently omit arbitrary cell->BEL pin maps. Restrict this
+    // path to the audited identity-mapped subset; do not call postPlace() or
+    // preRoute(), both of which mutate the implementation.
+    if (chip != ctx->id("GW5A-25A") || ctx->args.device != "GW5A-LV25MG121NC1/I0")
+        return false;
+    for (const char *stage : {"synth", "pack", "place", "route"})
+        if (!ctx->setting<bool>(stage, false))
+            log_error("Timing-only reload requires a completed %s checkpoint.\n", stage);
+    if (!ctx->settings.count(ctx->id("packer.partno")) || !ctx->settings.count(ctx->id("packer.chipdb")) ||
+        ctx->setting<std::string>("packer.partno") != ctx->args.device ||
+        ctx->setting<std::string>("packer.chipdb") != chip.str(ctx))
+        log_error("Timing-only checkpoint part/chip does not match the selected device.\n");
+    if (ctx->setting<bool>("timing/ignoreLoops", false) || ctx->setting<bool>("timing/ignoreRelClk", false))
+        log_error("Timing-only reload does not support ignored loops/clock relations.\n");
+
+    // This is an arithmetic-representability check, not a physical frequency
+    // bound. Retained unconstrained clocks use the checkpoint's native fallback.
+    const double fallback_period_ps = 1.0e12 / ctx->setting<double>("target_freq");
+    if (!std::isfinite(fallback_period_ps) || fallback_period_ps < 2 ||
+        fallback_period_ps > std::numeric_limits<delay_t>::max())
+        log_error("Timing-only checkpoint has an invalid target-frequency fallback.\n");
+    ctx->assignArchInfo();
+    assign_cell_info();
+    GowinModernFF route_validator;
+    pool<IdString> used_unconstrained_clocks;
+    for (const auto &entry : ctx->cells) {
+        const auto *ci = entry.second.get();
+        if (!(is_lut(ci) || is_dff(ci) || is_alu(ci) || ci->type == id_RAM16SDP4 || type_is_bsram(ci->type) ||
+              ci->type.in(id_IBUF, id_OBUF, id_IOBUF, id_TBUF, id_BUFG, id_PLLA, id_GSR, id_PINCFG,
+                          id_GOWIN_GND, id_GOWIN_VCC)))
+            log_error("Timing-only pin-map reconstruction is unsupported for %s (%s).\n", ctx->nameOf(ci),
+                      ci->type.c_str(ctx));
+        // Packed bidirectional/tristate IO cells are pre-bound by the IO
+        // packer, rather than admitted by the ordinary IBUF/OBUF placer bucket.
+        const bool packed_io = ci->bel != BelId() && ci->type.in(id_IOBUF, id_TBUF) &&
+                               ctx->getBelType(ci->bel) == id_IOB;
+        if (ci->bel == BelId() || (!packed_io && !isValidBelForCellType(ci->type, ci->bel)))
+            log_error("Timing-only cell %s is unplaced or has an incompatible BEL.\n", ctx->nameOf(ci));
+        if (is_dff(ci)) {
+            route_validator.check_cell(ctx, ci);
+            const auto mode = route_validator.data_mode(ctx, ci, true);
+            const auto saved = ci->attrs.find(ctx->id("MODERN_FF_DATA_MODE"));
+            if (saved != ci->attrs.end() && saved->second.as_string() != mode)
+                log_error("Stale saved FF data-mode annotation on %s.\n", ctx->nameOf(ci));
+        }
+        for (const auto &port : ci->ports) {
+            int count = 0;
+            if (ctx->getPortTimingClass(ci, port.first, count) != TMG_CLOCK_INPUT || !port.second.net)
+                continue;
+            const auto *net = port.second.net;
+            if (!net->clkconstr && unconstrained_clocks.count(net->name)) {
+                used_unconstrained_clocks.insert(net->name);
+                continue;
+            }
+            if (!net->clkconstr || net->clkconstr->period.minDelay() <= 0 ||
+                net->clkconstr->high.minDelay() <= 0 || net->clkconstr->low.minDelay() <= 0)
+                log_error("Timing-only clock %s needs an explicit positive waveform constraint on the packed net; "
+                          "input-port clock propagation is not rerun.\n", ctx->nameOf(net));
+        }
+    }
+
+    std::string unconstrained_names;
+    for (auto clock : unconstrained_clocks) {
+        if (!used_unconstrained_clocks.count(clock))
+            log_error("Timing-only unconstrained-clock declaration %s was not used.\n", clock.c_str(ctx));
+        log_warning("Timing-only clock %s explicitly retains its absent waveform constraint and the native "
+                    "target-frequency fallback; this is not clock-timing acceptance.\n", clock.c_str(ctx));
+        if (!unconstrained_names.empty())
+            unconstrained_names += ";";
+        unconstrained_names += clock.str(ctx);
+    }
+    ctx->settings[ctx->id("timing.reanalysis.unconstrained_clocks")] = unconstrained_names;
+
+    // Preserve PAD-side top-level nets, but never count them as routed fabric
+    // paths. The accepted roles are explicit, not a general undriven-net escape.
+    pool<IdString> pad_nets;
+    auto pad_role = [&](const CellInfo *ci, IdString pin) {
+        return (ci->type == id_IBUF && pin == id_I) ||
+               (ci->type.in(id_OBUF, id_TBUF) && pin == id_O) ||
+               (ci->type == id_IOBUF && pin == id_IO);
+    };
+    for (const auto &port : ctx->ports) {
+        const auto *net = port.second.net;
+        if (!net)
+            log_error("Timing-only top-level port %s has no net.\n", port.first.c_str(ctx));
+        if (!net->wires.empty() || (net->driver.cell && !pad_role(net->driver.cell, net->driver.port)))
+            log_error("Unsupported timing-only PAD net %s.\n", ctx->nameOf(net));
+        for (const auto &user : net->users)
+            if (!pad_role(user.cell, user.port))
+                log_error("Non-PAD user on timing-only port net %s.\n", ctx->nameOf(net));
+        pad_nets.insert(net->name);
+    }
+
+    // route_buffered_net() moves BUFG.O to the true source, and retains an
+    // undriven, empty input net and a placed BUFG marker. Recognize only that
+    // exact residual structure, and require its physical I wire to be present
+    // in the real source-driven route, which is fully checked below.
+    pool<IdString> bufg_marker_nets;
+    for (const auto &entry : ctx->cells) {
+        const auto *ci = entry.second.get();
+        if (ci->type != id_BUFG)
+            continue;
+        const auto *input = ci->getPort(id_I);
+        const auto input_wire = ctx->getBelPinWire(ci->bel, id_I);
+        const auto *owner = input_wire == WireId() ? nullptr : ctx->getBoundWireNet(input_wire);
+        if (!input || input->driver.cell || !input->wires.empty() || input->users.entries() != 1 ||
+            ci->getPort(id_O) || ci->ports.size() != 2 || !ci->ports.count(id_O) ||
+            !owner || owner == input || !owner->driver.cell || ctx->getNetinfoSourceWire(owner) == WireId())
+            log_error("Unsupported or incompletely routed timing-only BUFG marker %s.\n", ctx->nameOf(ci));
+        const auto &user = *input->users.begin();
+        if (user.cell != ci || user.port != id_I)
+            log_error("Unexpected input-net users on timing-only BUFG marker %s.\n", ctx->nameOf(ci));
+        bufg_marker_nets.insert(input->name);
+    }
+
+    size_t checked_wires = 0, checked_sinks = 0;
+    for (auto &entry : ctx->nets) {
+        auto *net = entry.second.get();
+        // Constant multi-root routing is architecture metadata, not present in
+        // the JSON. Restore it from the actual packed primitive and pin.
+        if (net->driver.cell && net->driver.cell->type == id_GOWIN_GND && net->driver.port == id_G)
+            net->constant_value = id_VSS;
+        else if (net->driver.cell && net->driver.cell->type == id_GOWIN_VCC && net->driver.port == id_V)
+            net->constant_value = id_VCC;
+        auto routing = net->attrs.find(ctx->id("ROUTING"));
+        if (routing == net->attrs.end())
+            log_error("Timing-only net %s lacks saved ROUTING.\n", ctx->nameOf(net));
+        const auto text = routing->second.as_string();
+        std::vector<std::string> fields;
+        if (!text.empty())
+            boost::split(fields, text, boost::is_any_of(";"));
+        if (fields.size() % 3 || fields.size() / 3 != net->wires.size())
+            log_error("Malformed or incompletely restored ROUTING on %s.\n", ctx->nameOf(net));
+        for (size_t i = 0; i < fields.size(); i += 3) {
+            const auto wire = ctx->getWireByName(IdStringList::parse(ctx, fields[i]));
+            const auto pip = fields[i + 1].empty() ? PipId() :
+                              ctx->getPipByName(IdStringList::parse(ctx, fields[i + 1]));
+            const auto found = net->wires.find(wire);
+            if (found == net->wires.end() || found->second.pip != pip ||
+                fields[i + 2] != std::to_string(found->second.strength))
+                log_error("ROUTING does not round-trip exactly on %s.\n", ctx->nameOf(net));
+        }
+        if (pad_nets.count(net->name) || bufg_marker_nets.count(net->name))
+            continue;
+        const auto source = ctx->getNetinfoSourceWire(net);
+        pool<WireId> verified;
+        for (const auto &wire : net->wires) {
+            if (ctx->getBoundWireNet(wire.first) != net)
+                log_error("Inconsistent bound-wire ownership on %s.\n", ctx->nameOf(net));
+            std::vector<WireId> chain;
+            pool<WireId> seen;
+            auto current = wire.first;
+            while (!verified.count(current)) {
+                const auto step = net->wires.find(current);
+                if (step == net->wires.end() || !seen.insert(current).second)
+                    log_error("Missing predecessor or cyclic timing-only route on %s.\n", ctx->nameOf(net));
+                chain.push_back(current);
+                const auto pip = step->second.pip;
+                if (pip == PipId()) {
+                    const bool root_ok = net->constant_value == IdString() ? current == source :
+                                         ctx->getWireConstantValue(current) == net->constant_value;
+                    if (!root_ok)
+                        log_error("Route on %s does not terminate at its declared driver/constant.\n", ctx->nameOf(net));
+                    break;
+                }
+                if (ctx->getPipDstWire(pip) != current || ctx->getBoundPipNet(pip) != net)
+                    log_error("Inconsistent timing-only pip on %s.\n", ctx->nameOf(net));
+                current = ctx->getPipSrcWire(pip);
+            }
+            for (auto w : chain)
+                verified.insert(w);
+        }
+        for (const auto &user : net->users) {
+            for (auto sink : ctx->getNetinfoSinkWires(net, user)) {
+                if (sink == WireId() || !verified.count(sink))
+                    log_error("Incomplete timing-only route %s -> %s.%s.\n", ctx->nameOf(net),
+                              ctx->nameOf(user.cell), user.port.c_str(ctx));
+                ++checked_sinks;
+            }
+        }
+        checked_wires += verified.size();
+    }
+    // Never inherit a saved model-selection claim as evidence of the active
+    // consumer. This refresh changes settings only, not cell parameters/attrs.
+    for (const char *key : {"timing.modern_ff.sidecar", "timing.modern_ff.source_sha256", "timing.modern_ff.verdict"})
+        ctx->settings.erase(ctx->id(key));
+    ctx->settings[ctx->id("timing.reanalysis.model")] = std::string(modern_ff ? "modern_ff" : "legacy_chipdb");
+    if (modern_ff) {
+        ctx->settings[ctx->id("timing.modern_ff.sidecar")] = ctx->args.options["modern_ff_timing"].as<std::string>();
+        ctx->settings[ctx->id("timing.modern_ff.source_sha256")] = modern_ff->source_sha256;
+        ctx->settings[ctx->id("timing.modern_ff.verdict")] = std::string("EXPERIMENTAL_FF_ONLY_NOT_TIMING_SIGNOFF");
+    }
+    log_info("Timing-only reload verified %zu cells, %zu nets, %zu wires and %zu sink wires; "
+             "%zu PAD nets and %zu physically witnessed BUFG marker nets.\n",
+             ctx->cells.size(), ctx->nets.size(), checked_wires, checked_sinks, pad_nets.size(), bufg_marker_nets.size());
+    return true;
+}
+
 // We do not allow the use of global wires that bypass a special router.
 bool GowinImpl::checkPipAvail(PipId pip) const
 {
+    if (!ff_d_from_sel && ctx->getWireType(ctx->getPipDstWire(pip)) == id_FF_INPUT &&
+        ctx->getWireType(ctx->getPipSrcWire(pip)) == id_MUX_SEL)
+        return false;
     return (ctx->getWireConstantValue(ctx->getPipSrcWire(pip)) != IdString()) ||
            (!(gwu.is_global_pip(pip) || gwu.is_segment_pip(pip)));
 }
 
 bool GowinImpl::checkPipAvailForNet(PipId pip, const NetInfo *net) const
 {
+    if (!ff_d_from_sel && ctx->getWireType(ctx->getPipDstWire(pip)) == id_FF_INPUT &&
+        ctx->getWireType(ctx->getPipSrcWire(pip)) == id_MUX_SEL)
+        return false;
     return (net->constant_value == IdString() && ctx->getWireConstantValue(ctx->getPipSrcWire(pip)) != IdString()) ||
            (!(gwu.is_global_pip(pip) || gwu.is_segment_pip(pip)));
 }
 
 void GowinImpl::pack()
 {
+    if (modern_ff) {
+        for (const auto &cell : ctx->cells)
+            GowinModernFF::require(!type_is_latch(cell.second->type), "latch timing is not covered");
+    }
     if (ctx->settings.count(ctx->id("cst.filename"))) {
         std::string filename = ctx->settings[ctx->id("cst.filename")].as_string();
         auto in = open_ifstream_and_log_error(filename, "CST file");
@@ -898,11 +1167,12 @@ void GowinImpl::prePlace()
     place_constrained_hclk_cells();
     ctx->assignArchInfo();
     assign_cell_info();
-    fast_logic_cell.reset(ctx->getGridDimX(), ctx->getGridDimY());
-    for (auto bel : ctx->getBels()) {
-        if (ctx->getBelType(bel) == id_LUT4) {
-            Loc loc = ctx->getBelLocation(bel);
-            fast_logic_cell.at(loc.x, loc.y).resize(37);
+    if (modern_ff) {
+        for (const auto &cell : ctx->cells) {
+            if (!is_dff(cell.second.get()))
+                continue;
+            modern_ff->check_cell(ctx, cell.second.get());
+            modern_ff->data_mode(ctx, cell.second.get());
         }
     }
 }
@@ -931,6 +1201,15 @@ void GowinImpl::preRoute() { gowin_route_globals(ctx); }
 
 void GowinImpl::postRoute()
 {
+    if (modern_ff) {
+        for (const auto &cell : ctx->cells) {
+            if (!is_dff(cell.second.get()))
+                continue;
+            auto mode = modern_ff->data_mode(ctx, cell.second.get(), true);
+            cell.second->setAttr(ctx->id("MODERN_FF_DATA_MODE"), mode);
+            log_info("Modern FF data mode %s: %s\n", ctx->nameOf(cell.second.get()), mode.c_str());
+        }
+    }
     std::set<IdString> visited_hclk_users;
 
     for (auto &cell : ctx->cells) {
@@ -1196,7 +1475,8 @@ void GowinImpl::assign_cell_info()
     }
 }
 
-// If there is an unused LUT next to the DFF, use its inputs for the D input
+// Supply a LUT data path for unpaired registers unless the experimental SEL
+// path is enabled. Constant inputs still need a LUT even with SEL routing.
 void GowinImpl::create_passthrough_luts(void)
 {
     std::vector<std::unique_ptr<CellInfo>> new_cells;
@@ -1210,16 +1490,19 @@ void GowinImpl::create_passthrough_luts(void)
             const CellInfo *ramw = ctx->getBoundBelCell(ctx->getBelByLocation(Loc(loc.x, loc.y, BelZ::RAMW_Z)));
 
             if (!(lut || alu || ramw)) {
+                NetInfo *d_net = ci->getPort(id_D);
+                NPNR_ASSERT(d_net != nullptr);
+                bool is_const = d_net->name == ctx->id("$PACKER_GND") || d_net->name == ctx->id("$PACKER_VCC");
+                if (ff_d_from_sel && !is_const)
+                    continue;
                 if (ctx->debug) {
                     log_info("Found an unused LUT:%s, ", ctx->nameOfBel(lut_bel));
                 }
                 // make LUT
                 auto lut_cell = gwu.create_cell(gwu.create_aux_name(ci->name, 0, "_passthrough_lut$"), id_LUT4);
                 CellInfo *lut = lut_cell.get();
-                NetInfo *d_net = ci->getPort(id_D);
-                NPNR_ASSERT(d_net != nullptr);
 
-                if (d_net->name == ctx->id("$PACKER_GND") || d_net->name == ctx->id("$PACKER_VCC")) {
+                if (is_const) {
                     if (ctx->debug) {
                         log_info("make a constant %s.\n", d_net->name == ctx->id("$PACKER_VCC") ? "VCC" : "GND");
                     }
@@ -1426,8 +1709,12 @@ bool GowinImpl::slice_valid(int x, int y, int z) const
         static std::vector<int> mux_z = {BelZ::MUX20_Z,     BelZ::MUX21_Z,     BelZ::MUX20_Z + 4,  BelZ::MUX23_Z,
                                          BelZ::MUX20_Z + 8, BelZ::MUX21_Z + 8, BelZ::MUX20_Z + 12, BelZ::MUX27_Z};
         const auto &ff_data = fast_cell_info.at(ff->flat_index);
-        const NetInfo *src;
-        // check implcit LUT(ALU) -> FF connection
+        const NetInfo *src = nullptr;
+        const bool is_const = ff_data.ff_d &&
+                              (ff_data.ff_d->name == ctx->id("$PACKER_GND") ||
+                               ff_data.ff_d->name == ctx->id("$PACKER_VCC"));
+        // Check the implicit LUT(ALU) -> FF connection. Independent data is
+        // legal only with the opt-in SEL path; constants need their own LUT.
         NPNR_ASSERT(!ramw); // XXX shouldn't happen for now
         if (lut || alu) {
             if (lut && lut->type != id_BLOCKER_LUT) {
@@ -1439,9 +1726,17 @@ bool GowinImpl::slice_valid(int x, int y, int z) const
                 // placed (yet), so the FF cannot be driven from here.
                 return false;
             }
-            if (ff_data.ff_d != src) {
+            if (ff_data.ff_d != src && (!independent_ff || is_const)) {
                 return false;
             }
+        }
+        if (ff_d_from_sel && ff_data.ff_d != src) {
+            // A wide LUT and a routed register share SEL<z>. They may coexist
+            // only when they select the same net. Paired F -> XD paths do not
+            // consume SEL and are unaffected.
+            const CellInfo *mux = bels.at(mux_z.at(z));
+            if (mux && mux->getPort(id_S0) != ff_data.ff_d)
+                return false;
         }
         if (adj_ff) {
             if (incompatible_ffs(ff, adj_ff)) {
@@ -1657,6 +1952,17 @@ void GowinImpl::notifyBelChange(BelId bel, CellInfo *cell)
 
 void GowinImpl::configurePlacerHeap(PlacerHeapCfg &cfg)
 {
+    // Trace requests are selected by the current CLI, never inherited from
+    // a checkpoint. Avoid interning extra IDs in the unchanged default flow.
+    std::vector<IdString> stale_options;
+    for (const auto &setting : ctx->settings)
+        if (setting.first.str(ctx) == "placerHeap/timingTrace")
+            stale_options.push_back(setting.first);
+    for (auto option : stale_options)
+        ctx->settings.erase(option);
+    if (ctx->args.options.count("placer_timing_trace"))
+        ctx->settings[ctx->id("placerHeap/timingTrace")] = ctx->args.options["placer_timing_trace"].as<std::string>();
+
     // Use cell groups to enforce a legalisation order
     cfg.cellGroups.emplace_back();
     cfg.cellGroups.back().insert(id_RAM16SDP4);

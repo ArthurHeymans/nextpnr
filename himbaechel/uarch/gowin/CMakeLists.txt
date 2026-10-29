@@ -12,6 +12,7 @@ set(SOURCES
     gowin.h
     gowin_utils.cc
     gowin_utils.h
+    modern_ff.h
     pack.cc
     pack_bsram.cc
     pack_dsp.cc

@@ -32,6 +32,12 @@ function run_tests {
     popd
     export PATH=${GITHUB_WORKSPACE}/.yosys/bin:$PATH
     NEXTPNR_HIMBAECHEL=$(pwd)/build/nextpnr-himbaechel python3 himbaechel/uarch/gowin/tests/alu_ff.py
+    NEXTPNR_HIMBAECHEL=$(pwd)/build/nextpnr-himbaechel python3 himbaechel/uarch/gowin/tests/independent_ff.py
+    python3 himbaechel/uarch/gowin/tests/bram_timing.py
+    python3 himbaechel/uarch/gowin/tests/cell_timing_test.py
+    python3 himbaechel/uarch/gowin/tests/timing_reload_test.py
+    NEXTPNR_HIMBAECHEL=$(pwd)/build/nextpnr-himbaechel python3 himbaechel/uarch/gowin/tests/timing_reload_flow.py
+    NEXTPNR_HIMBAECHEL=$(pwd)/build/nextpnr-himbaechel python3 himbaechel/uarch/gowin/tests/placer_timing_trace.py
 }
 
 function run_archcheck {

@@ -1,0 +1,6 @@
+IO_LOC "clk" E2;
+IO_LOC "data" B3;
+IO_LOC "a" G11;
+IO_LOC "b" D11;
+IO_LOC "q" C3;
+IO_LOC "lut_out" E8;

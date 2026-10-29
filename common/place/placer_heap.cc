@@ -37,6 +37,7 @@
 #include <boost/optional.hpp>
 #include <chrono>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <numeric>
@@ -44,6 +45,7 @@
 #include <tuple>
 #include "array2d.h"
 #include "fast_bels.h"
+#include "json11.hpp"
 #include "log.h"
 #include "nextpnr.h"
 #include "parallel_refine.h"
@@ -164,8 +166,25 @@ class HeAPPlacer
     HeAPPlacer(Context *ctx, PlacerHeapCfg cfg)
             : ctx(ctx), cfg(cfg), fast_bels(ctx, /*check_bel_available=*/true, -1), tmg(ctx)
     {
+        // Read opt-in experimental settings without interning IDs in the
+        // default flow. Merely enabling a trace must not alter placement.
+        std::string trace_filename;
+        for (const auto &setting : ctx->settings) {
+            if (setting.first.str(ctx) == "placerHeap/timingTrace")
+                trace_filename = setting.second.as_string();
+        }
+        if (!trace_filename.empty() && !cfg.timing_driven)
+            log_error("HeAP timing trace requires timing-driven placement.\n");
+        if (!trace_filename.empty()) {
+            if (std::filesystem::exists(trace_filename) || std::filesystem::is_symlink(trace_filename))
+                log_error("HeAP timing trace must name a new file.\n");
+            timing_trace.open(trace_filename);
+            if (!timing_trace)
+                log_error("Cannot open HeAP timing trace '%s'.\n", trace_filename.c_str());
+        }
         tmg.setup_only = true;
         tmg.setup();
+        trace_timing("setup_unplaced", -1, 0, false);
 
         for (auto &cell : ctx->cells)
             if (!cell.second->isPseudo() && cell.second->cluster != ClusterId())
@@ -302,14 +321,15 @@ class HeAPPlacer
                          std::chrono::duration<double>(run_stopt - run_startt).count());
             }
 
-            // Update timing weights
+            // Update timing weights. Request reports only for opt-in
+            // diagnostics; preserve the original HPWL retention/convergence.
             if (cfg.timing_driven)
-                tmg.run();
+                tmg.run(true, false, false, timing_trace.is_open());
 
-            if (legal_hpwl < best_hpwl) {
+            const bool retain = legal_hpwl < best_hpwl;
+            if (retain) {
                 best_hpwl = legal_hpwl;
                 stalled = 0;
-                // Save solution
                 solution.clear();
                 for (auto &cell : ctx->cells) {
                     if (cell.second->isPseudo())
@@ -319,6 +339,7 @@ class HeAPPlacer
             } else {
                 ++stalled;
             }
+            trace_timing("legal_iteration", iter, legal_hpwl, retain);
             for (auto &cl : cell_locs) {
                 cl.legal_x = cl.x;
                 cl.legal_y = cl.y;
@@ -343,6 +364,11 @@ class HeAPPlacer
             if (bel == BelId())
                 continue;
             ctx->bindBel(bel, cell, strength);
+        }
+
+        if (timing_trace.is_open()) {
+            tmg.run(true, false, false, true);
+            trace_timing("retained_solution", iter, best_hpwl, true);
         }
 
         // Find and display all errors to help in finding the root cause of issues
@@ -415,6 +441,13 @@ class HeAPPlacer
             }
         }
 
+        if (timing_trace.is_open()) {
+            std::lock_guard<Context> lock{*ctx};
+            tmg.run(true, false, false, true);
+            // The refiner does not refresh HeAP's private cell_locs. Do not
+            // publish their stale HPWL as a post-refinement measurement.
+            trace_timing("after_refine", iter, 0, false);
+        }
         return true;
     }
 
@@ -427,6 +460,88 @@ class HeAPPlacer
     dict<IdString, std::tuple<int, int>> bel_types;
 
     TimingAnalyser tmg;
+    std::ofstream timing_trace;
+
+    double predicted_timing_ratio()
+    {
+        double ratio = std::numeric_limits<double>::infinity();
+        for (const auto &clock : tmg.get_timing_result().clock_fmax) {
+            const auto &f = clock.second;
+            if (!std::isfinite(f.achieved) || !std::isfinite(f.constraint) || f.constraint <= 0)
+                continue;
+            ratio = std::min(ratio, double(f.achieved) / double(f.constraint));
+        }
+        return std::isfinite(ratio) ? ratio : std::numeric_limits<double>::quiet_NaN();
+    }
+
+    void trace_timing(const char *stage, int iteration, wirelen_t hpwl, bool retained)
+    {
+        if (!timing_trace.is_open())
+            return;
+        using J = json11::Json;
+        J::object clocks;
+        for (const auto &clock : tmg.get_timing_result().clock_fmax)
+            clocks[clock.first.str(ctx)] = J::object{{"achieved_mhz", clock.second.achieved},
+                                                    {"constraint_mhz", clock.second.constraint}};
+        std::vector<CellInfo *> cells;
+        for (auto &entry : ctx->cells)
+            cells.push_back(entry.second.get());
+        std::sort(cells.begin(), cells.end(), [&](const CellInfo *a, const CellInfo *b) {
+            return a->name.str(ctx) < b->name.str(ctx);
+        });
+        J::array sinks;
+        for (auto *cell : cells) {
+            std::vector<IdString> pins;
+            for (const auto &port : cell->ports)
+                if (port.second.net && port.second.type == PORT_IN)
+                    pins.push_back(port.first);
+            std::sort(pins.begin(), pins.end(), [&](IdString a, IdString b) { return a.str(ctx) < b.str(ctx); });
+            for (auto pin : pins) {
+                const auto *net = cell->getPort(pin);
+                const auto *driver = net->driver.cell;
+                const CellPortKey key(cell->name, pin);
+                const float crit = tmg.get_criticality(key), slack = tmg.get_setup_slack(key);
+                int count = 0;
+                const auto cls = ctx->getPortTimingClass(cell, pin, count);
+                J predicted_delay, setup_slack;
+                if (driver && driver->bel != BelId() && cell->bel != BelId())
+                    predicted_delay = ctx->getDelayNS(ctx->predictArcDelay(net, PortRef{cell, pin}));
+                if (slack != float(std::numeric_limits<delay_t>::max()) && std::isfinite(slack))
+                    setup_slack = ctx->getDelayNS(delay_t(slack));
+                J::array clocking;
+                if (cls == TMG_REGISTER_INPUT)
+                    for (int i = 0; i < count; ++i) {
+                        const auto info = ctx->getPortClockingInfo(cell, pin, i);
+                        clocking.push_back(J::object{{"clock_port", info.clock_port.str(ctx)},
+                                                     {"setup_max_ns", ctx->getDelayNS(info.setup.maxDelay())},
+                                                     {"hold_max_ns", ctx->getDelayNS(info.hold.maxDelay())}});
+                    }
+                sinks.push_back(J::object{{"cell", cell->name.str(ctx)}, {"type", cell->type.str(ctx)},
+                                          {"port", pin.str(ctx)}, {"net", net->name.str(ctx)},
+                                          {"bel", cell->bel == BelId() ? J() : J(ctx->getBelName(cell->bel).str(ctx))},
+                                          {"driver", driver ? J(driver->name.str(ctx)) : J()},
+                                          {"driver_type", driver ? J(driver->type.str(ctx)) : J()},
+                                          {"driver_port", driver ? J(net->driver.port.str(ctx)) : J()},
+                                          {"driver_bel", driver && driver->bel != BelId() ? J(ctx->getBelName(driver->bel).str(ctx)) : J()},
+                                          {"criticality", std::isfinite(crit) ? J(crit) : J()},
+                                          {"predicted_setup_slack_ns", setup_slack}, {"predicted_route_ns", predicted_delay},
+                                          {"queried_clocking", clocking}});
+            }
+        }
+        const double ratio = predicted_timing_ratio();
+        const bool hpwl_available = std::string(stage) == "legal_iteration" || std::string(stage) == "retained_solution";
+        const J frame = J::object{{"stage", stage}, {"iteration", iteration},
+                                  {"hpwl", hpwl_available ? J(double(hpwl)) : J()},
+                                  {"hpwl_basis", hpwl_available ? "HEAP_LEGAL_OBJECTIVE" : "UNAVAILABLE"},
+                                  {"retained", retained}, {"selection_policy", "MIN_HPWL"},
+                                  {"predicted_worst_target_ratio", std::isfinite(ratio) ? J(ratio) : J()},
+                                  {"fmax", clocks}, {"sinks", sinks},
+                                  {"verdict", "PLACEMENT_HEURISTIC_DIAGNOSTIC_NOT_ROUTED_OR_PHYSICAL_TIMING"}};
+        timing_trace << frame.dump() << '\n';
+        timing_trace.flush();
+        if (!timing_trace)
+            log_error("Failed to write HeAP timing trace.\n");
+    }
 
     dict<IdString, BoundingBox> constraint_region_bounds;
 

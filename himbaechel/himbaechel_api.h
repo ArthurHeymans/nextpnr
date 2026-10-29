@@ -152,6 +152,11 @@ struct HimbaechelAPI
     virtual std::string getDefaultRouter() const { return "router1"; };
 
     virtual ~HimbaechelAPI() {};
+
+    // Restore only architecture metadata needed for analysis of a fully
+    // packed, placed and routed checkpoint. Never run implementation passes.
+    // Opt in per uarch: unsupported reconstruction must fail closed.
+    virtual bool prepareTimingOnly(const pool<IdString> &unconstrained_clocks) { return false; }
 };
 
 struct HimbaechelArch
